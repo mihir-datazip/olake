@@ -12,7 +12,6 @@ require (
 	github.com/goccy/go-json v0.10.5
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/lib/pq v1.10.9
-	github.com/linkedin/goavro/v2 v2.15.0
 	github.com/minio/minio-go/v7 v7.0.34
 	github.com/moby/moby/api v1.54.1
 	github.com/parquet-go/parquet-go v0.25.0
@@ -20,9 +19,6 @@ require (
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.20.1
 	github.com/stretchr/testify v1.11.1
-	github.com/twmb/franz-go v1.21.1
-	github.com/twmb/franz-go/pkg/kadm v1.18.0
-	github.com/twmb/franz-go/pkg/kmsg v1.13.1
 	github.com/twmb/murmur3 v1.1.8
 	github.com/xitongsys/parquet-go v1.6.2
 	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b

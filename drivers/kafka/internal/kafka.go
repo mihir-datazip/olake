@@ -9,7 +9,7 @@ import (
 	"slices"
 	"sync"
 
-	kafkapkg "github.com/datazip-inc/olake/pkg/kafka"
+	kafkapkg "github.com/datazip-inc/olake/drivers/kafka/internal/kafka"
 	kafkaplain "github.com/twmb/franz-go/pkg/sasl/plain"
 	kafkascram "github.com/twmb/franz-go/pkg/sasl/scram"
 
@@ -222,7 +222,7 @@ func (k *Kafka) ProduceSchema(ctx context.Context, streamID types.StreamID) (*ty
 
 		messageCount := 0
 
-		_ = k.processKafkaMessages(ctx, reader, func(record types.KafkaRecord) (bool, error) {
+		_ = k.processKafkaMessages(ctx, reader, func(record kafkapkg.KafkaRecord) (bool, error) {
 			messageCount++
 			if record.Data != nil {
 				mu.Lock()
@@ -354,7 +354,7 @@ func (k *Kafka) buildTLSConfig() (*tls.Config, error) {
 }
 
 // checkPartitionCompletion checks if a partition is complete and handles loop termination
-func (k *Kafka) checkPartitionCompletion(assignedPartitions []types.PartitionKey, completedPartitions, observedPartitions map[types.PartitionKey]struct{}) (bool, error) {
+func (k *Kafka) checkPartitionCompletion(assignedPartitions []kafkapkg.PartitionKey, completedPartitions, observedPartitions map[kafkapkg.PartitionKey]struct{}) (bool, error) {
 	// cache observed partitions
 	if len(observedPartitions) == 0 {
 		// Ensure we have all assigned partitions tracked
@@ -371,7 +371,7 @@ func (k *Kafka) checkPartitionCompletion(assignedPartitions []types.PartitionKey
 
 // getReaderAssignedPartitions queries the consumer group and returns topic/partition pairs
 // assigned to the reader identified by readerIndex. We match on the per-reader readerID.
-func (k *Kafka) getReaderAssignedPartitions(ctx context.Context, readerIndex int) ([]types.PartitionKey, error) {
+func (k *Kafka) getReaderAssignedPartitions(ctx context.Context, readerIndex int) ([]kafkapkg.PartitionKey, error) {
 	readerID, _ := k.readerManager.GetReaderIDAndClientID(readerIndex)
 	if readerID == "" {
 		return nil, fmt.Errorf("readerID not found for reader index %d", readerIndex)
@@ -386,7 +386,7 @@ func (k *Kafka) getReaderAssignedPartitions(ctx context.Context, readerIndex int
 		return nil, fmt.Errorf("describe group %s response error: %s", k.consumerGroupID, describeGroupResp.Error())
 	}
 
-	var assigned []types.PartitionKey
+	var assigned []kafkapkg.PartitionKey
 	for _, member := range describeGroupResp[k.consumerGroupID].Members {
 		if member.InstanceID == nil || *member.InstanceID != readerID {
 			continue
@@ -399,7 +399,7 @@ func (k *Kafka) getReaderAssignedPartitions(ctx context.Context, readerIndex int
 
 		for _, topic := range assignment.Topics {
 			for _, partition := range topic.Partitions {
-				assigned = append(assigned, types.PartitionKey{Topic: topic.Topic, Partition: partition})
+				assigned = append(assigned, kafkapkg.PartitionKey{Topic: topic.Topic, Partition: partition})
 			}
 		}
 	}

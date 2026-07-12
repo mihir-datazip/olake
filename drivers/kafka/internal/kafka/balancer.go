@@ -1,7 +1,6 @@
 package kafka
 
 import (
-	"github.com/datazip-inc/olake/types"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -46,11 +45,11 @@ func (b *CustomGroupBalancer) Balance(consumerBalancer *kgo.ConsumerBalancer, pa
 	}
 
 	// active partitions with data in partition metadata
-	activePartitions := make([]types.PartitionKey, 0)
+	activePartitions := make([]PartitionKey, 0)
 	for topic, partitions := range partitionsPerTopic {
 		for partition := range partitions {
 			if _, ok := b.partitionMeta[PartitionMetadataKey(topic, partition)]; ok {
-				activePartitions = append(activePartitions, types.PartitionKey{Topic: topic, Partition: partition})
+				activePartitions = append(activePartitions, PartitionKey{Topic: topic, Partition: partition})
 			}
 		}
 	}

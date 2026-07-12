@@ -1,8 +1,10 @@
-package types
+package kafka
 
 import (
 	"github.com/linkedin/goavro/v2"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/datazip-inc/olake/types"
 )
 
 type SchemaType string
@@ -16,7 +18,7 @@ const (
 // PartitionMetaData holds metadata about a Kafka partition for a specific stream reader
 type PartitionMetaData struct {
 	ReaderID        string
-	Stream          StreamInterface
+	Stream          types.StreamInterface
 	PartitionID     int32
 	EndOffset       int64
 	CommittedOffset int64

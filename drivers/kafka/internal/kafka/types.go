@@ -5,7 +5,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/datazip-inc/olake/types"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -36,19 +35,19 @@ type kafkaReader struct {
 type ReaderManager struct {
 	config        ReaderConfig
 	readers       []*kafkaReader
-	topics        []string                           // topics to be consumed
-	partitionMeta map[string]types.PartitionMetaData // get per-partition boundaries
-	exitMode      atomic.Int32                       // normalProcessing | gracefulExit | nonRetryableExit
-	generationID  atomic.Int32                       // consumer group generationId: used to detect rebalances
+	topics        []string                     // topics to be consumed
+	partitionMeta map[string]PartitionMetaData // get per-partition boundaries
+	exitMode      atomic.Int32                 // normalProcessing | gracefulExit | nonRetryableExit
+	generationID  atomic.Int32                 // consumer group generationId: used to detect rebalances
 }
 
 // CustomGroupBalancer ensures proper consumer ID distribution according to requirements
 type CustomGroupBalancer struct {
-	partitionMeta map[string]types.PartitionMetaData
+	partitionMeta map[string]PartitionMetaData
 }
 
 // NewCustomGroupBalancer returns a balancer that assigns only partitions present in partitionMeta.
-func NewCustomGroupBalancer(partitionMeta map[string]types.PartitionMetaData) *CustomGroupBalancer {
+func NewCustomGroupBalancer(partitionMeta map[string]PartitionMetaData) *CustomGroupBalancer {
 	return &CustomGroupBalancer{partitionMeta: partitionMeta}
 }
 

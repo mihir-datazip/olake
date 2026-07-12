@@ -13,8 +13,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/datazip-inc/olake/constants"
-	kafkapkg "github.com/datazip-inc/olake/pkg/kafka"
-	"github.com/datazip-inc/olake/types"
+	kafkapkg "github.com/datazip-inc/olake/drivers/kafka/internal/kafka"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/testutils"
 	"github.com/linkedin/goavro/v2"
@@ -248,7 +247,7 @@ func startRebalanceTrigger(ctx context.Context, t *testing.T, topic string) {
 			kgo.ClientID(instanceID),
 			kgo.InstanceID(instanceID),
 			kgo.ConsumeTopics(topic),
-			kgo.Balancers(kafkapkg.NewCustomGroupBalancer(map[string]types.PartitionMetaData{
+			kgo.Balancers(kafkapkg.NewCustomGroupBalancer(map[string]kafkapkg.PartitionMetaData{
 				kafkapkg.PartitionMetadataKey(topic, rebalanceBulkPartition): {PartitionID: rebalanceBulkPartition},
 			})),
 			kgo.DisableAutoCommit(),

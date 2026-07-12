@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/typeutils"
 	"github.com/linkedin/goavro/v2"
@@ -42,10 +41,10 @@ func (c *SchemaRegistryClient) schemaRegistryGetRequest(path string) (*http.Resp
 
 // TODO: fetch schema by subject strategy if needed (e.g. latest, version specific)
 // currently we only fetch by ID which is sufficient for deserialization of consumed messages
-func (c *SchemaRegistryClient) FetchSchema(schemaID uint32) (*types.RegisteredSchema, error) {
+func (c *SchemaRegistryClient) FetchSchema(schemaID uint32) (*RegisteredSchema, error) {
 	// if schema exists previously
 	if schema, ok := c.schemaMap.Load(schemaID); ok {
-		return schema.(*types.RegisteredSchema), nil
+		return schema.(*RegisteredSchema), nil
 	}
 
 	// fetch schema from registry
@@ -68,17 +67,17 @@ func (c *SchemaRegistryClient) FetchSchema(schemaID uint32) (*types.RegisteredSc
 	}
 
 	// determine schema type
-	schemaType := types.SchemaType(schemaResp.SchemaType)
+	schemaType := SchemaType(schemaResp.SchemaType)
 
 	// Note: AVRO is the default (if no schema type is shown on the response, the type is AVRO), PROTOBUF, JSON [official docs: https://docs.confluent.io/platform/current/schema-registry/develop/api.html]
-	schemaType = utils.Ternary(schemaType == "", types.SchemaTypeAvro, schemaType).(types.SchemaType)
+	schemaType = utils.Ternary(schemaType == "", SchemaTypeAvro, schemaType).(SchemaType)
 
-	registered := &types.RegisteredSchema{
+	registered := &RegisteredSchema{
 		SchemaType: schemaType,
 	}
 
 	// parse Avro codec if schema type is Avro
-	if schemaType == types.SchemaTypeAvro {
+	if schemaType == SchemaTypeAvro {
 		normalizedSchema, err := typeutils.NormalizeAvroSchema(schemaResp.Schema)
 		if err != nil {
 			return nil, fmt.Errorf("failed to normalize schema ID %d: %s", schemaID, err)
