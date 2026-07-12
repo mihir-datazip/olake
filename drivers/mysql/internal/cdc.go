@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/datazip-inc/olake/drivers/abstract"
-	"github.com/datazip-inc/olake/pkg/binlog"
+	"github.com/datazip-inc/olake/drivers/mysql/internal/binlog"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
