@@ -14,7 +14,6 @@ import (
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/paulmach/orb/encoding/wkb"
 	"github.com/paulmach/orb/encoding/wkt"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 var (
@@ -200,7 +199,8 @@ func ReformatDate(v interface{}, isTimestampInDB bool) (time.Time, error) {
 				return time.Time{}, fmt.Errorf("empty string passed")
 			}
 			return parseStringTimestamp(*v, isTimestampInDB)
-		case primitive.DateTime:
+		case interface{ Time() time.Time }:
+			// covers bson primitive.DateTime without importing the mongo driver
 			return v.Time(), nil
 		case *any:
 			return ReformatDate(*v, isTimestampInDB)

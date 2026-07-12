@@ -12,7 +12,6 @@ import (
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/typeutils"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func (a *AbstractDriver) Incremental(mainCtx context.Context, pool *destination.WriterPool, streams ...types.StreamInterface) error {
@@ -200,7 +199,8 @@ func (a *AbstractDriver) FormatCursorValue(cursorValue any) any {
 			return v.Format(constants.DB2StateTimestampFormat)
 		}
 		return v.UTC().Format(constants.DefaultStateTimestampFormat)
-	case primitive.ObjectID:
+	case interface{ Hex() string }:
+		// covers bson primitive.ObjectID without importing the mongo driver
 		return v.Hex()
 	default:
 		return cursorValue

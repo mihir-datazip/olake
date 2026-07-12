@@ -15,8 +15,20 @@ import (
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/encoding/wkb"
 	"github.com/stretchr/testify/assert"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+// testDateTime mirrors bson primitive.DateTime (milliseconds since epoch with a
+// Time() method) so ReformatDate's mongo handling stays covered without
+// importing the mongo driver.
+type testDateTime int64
+
+func (d testDateTime) Time() time.Time {
+	return time.Unix(int64(d)/1000, int64(d)%1000*1e6).UTC()
+}
+
+func newTestDateTime(t time.Time) testDateTime {
+	return testDateTime(t.Unix()*1000 + int64(t.Nanosecond()/1e6))
+}
 
 // TestReformatRecord tests the ReformatRecord function
 func TestReformatRecord(t *testing.T) {
@@ -1019,34 +1031,34 @@ func TestReformatDate(t *testing.T) {
 			expectedErr:     fmt.Errorf("string does not start with date pattern (YYYY-MM-DD)"),
 		},
 
-		// ===== primitive.DateTime =====
+		// ===== bson DateTime (matched via Time() method) =====
 		{
 			name:            "primitive datetime",
-			v:               primitive.NewDateTimeFromTime(now),
+			v:               newTestDateTime(now),
 			isTimestampInDB: true,
-			expected:        primitive.NewDateTimeFromTime(now).Time(),
+			expected:        newTestDateTime(now).Time(),
 			expectedErr:     nil,
 		},
 		{
 			name:            "primitive datetime year zero",
-			v:               primitive.NewDateTimeFromTime(time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC)),
+			v:               newTestDateTime(time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC)),
 			isTimestampInDB: true,
 			expected:        time.Unix(0, 0).UTC(),
 			expectedErr:     nil,
 		},
 		{
 			name:            "primitive datetime negative year",
-			v:               primitive.NewDateTimeFromTime(time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC)),
+			v:               newTestDateTime(time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC)),
 			isTimestampInDB: true,
 			expected:        time.Unix(0, 0).UTC(),
 			expectedErr:     nil,
 		},
 		{
 			name:            "primitive datetime year above max",
-			v:               primitive.NewDateTimeFromTime(time.Date(22000, 5, 10, 0, 0, 0, 0, time.UTC)),
+			v:               newTestDateTime(time.Date(22000, 5, 10, 0, 0, 0, 0, time.UTC)),
 			isTimestampInDB: true,
 			expected: func() time.Time {
-				parsed := primitive.NewDateTimeFromTime(time.Date(22000, 5, 10, 0, 0, 0, 0, time.UTC)).Time()
+				parsed := newTestDateTime(time.Date(22000, 5, 10, 0, 0, 0, 0, time.UTC)).Time()
 				return parsed.AddDate(-(parsed.Year() - 9999), 0, 0)
 			}(),
 			expectedErr: nil,
