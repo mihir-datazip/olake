@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/abstract"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/typeutils"

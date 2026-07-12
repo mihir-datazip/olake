@@ -3,9 +3,9 @@ package olake
 import (
 	"os"
 
+	"github.com/datazip-inc/olake/abstract"
 	_ "github.com/datazip-inc/olake/destination/iceberg" // registering iceberg destination
 	_ "github.com/datazip-inc/olake/destination/parquet" // registering parquet destination
-	"github.com/datazip-inc/olake/drivers/abstract"
 	protocol "github.com/datazip-inc/olake/protocol"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/safego"

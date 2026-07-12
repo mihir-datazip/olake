@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/datazip-inc/olake/abstract"
 	"github.com/datazip-inc/olake/constants"
-	"github.com/datazip-inc/olake/drivers/abstract"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgproto3"

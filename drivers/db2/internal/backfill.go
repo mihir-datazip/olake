@@ -8,9 +8,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/datazip-inc/olake/abstract"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
-	"github.com/datazip-inc/olake/drivers/abstract"
 	"github.com/datazip-inc/olake/pkg/jdbc"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
