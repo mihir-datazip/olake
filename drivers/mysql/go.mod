@@ -3,12 +3,13 @@ module github.com/datazip-inc/olake/drivers/mysql
 go 1.25.12
 
 require (
-	github.com/datazip-inc/olake v0.0.0-20250312070222-ed705d25bc0c
+	github.com/datazip-inc/olake v0.0.0-00010101000000-000000000000
 	github.com/go-sql-driver/mysql v1.8.1
 )
 
 require (
 	github.com/apache/arrow-go/v18 v18.2.0
+	github.com/datazip-inc/olake/utils/testutils v0.0.0-00010101000000-000000000000
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/stretchr/testify v1.11.1
 )
@@ -57,8 +58,6 @@ require (
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/asmfmt v1.3.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
-	github.com/lib/pq v1.10.9 // indirect
-	github.com/linkedin/goavro/v2 v2.15.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -94,8 +93,6 @@ require (
 	github.com/testcontainers/testcontainers-go v0.42.0 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
-	github.com/twmb/franz-go v1.21.1 // indirect
-	github.com/twmb/franz-go/pkg/kmsg v1.13.1 // indirect
 	github.com/twmb/murmur3 v1.1.8 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
@@ -103,6 +100,7 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.60.0 // indirect
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6 // indirect
 	golang.org/x/mod v0.35.0 // indirect
@@ -177,3 +175,5 @@ replace (
 	github.com/datazip-inc/olake => ../../
 	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20240123012728-ef4313101c80
 )
+
+replace github.com/datazip-inc/olake/utils/testutils => ../../utils/testutils
