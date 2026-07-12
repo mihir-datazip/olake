@@ -2,17 +2,37 @@
 FROM golang:1.25.12-bookworm AS builder
 
 WORKDIR /home/app
-COPY . .
 
 ARG DRIVER_NAME=olake
+
+# Module manifests only: the target driver's module, the root module it
+# imports, and testutils (required test-only by driver go.mods, so its go.mod
+# must be resolvable for the module graph). Other drivers never enter this stage.
+COPY go.mod ./
+COPY utils/testutils/go.mod utils/testutils/
+COPY drivers/${DRIVER_NAME}/go.mod drivers/${DRIVER_NAME}/
+
+# The repo-wide go.work lists every driver module; synthesize a workspace
+# scoped to this driver so dependency resolution stays per-driver.
+RUN go work init . ./drivers/${DRIVER_NAME}
+
+# Root-module source shared by all drivers
+COPY connector.go ./
+COPY abstract/ abstract/
+COPY constants/ constants/
+COPY destination/ destination/
+COPY pkg/ pkg/
+COPY protocol/ protocol/
+COPY types/ types/
+COPY utils/ utils/
+
+# Target driver source only
+COPY drivers/${DRIVER_NAME}/ drivers/${DRIVER_NAME}/
 
 # DB2 conditional setup
 RUN if [ "$DRIVER_NAME" = "db2" ]; then \
   mkdir -p /go/pkg/mod/github.com/ibmdb && \
   go run -C drivers/db2 github.com/ibmdb/go_ibm_db/installer@v0.4.5 /go/pkg/mod/github.com/ibmdb; \
-else \
-  # for other drivers, create empty clidriver directory to avoid build failure
-  mkdir -p /go/pkg/mod/github.com/ibmdb/clidriver; \
 fi
 
 # Build the Go binary
@@ -51,7 +71,7 @@ ARG DRIVER_NAME=olake
 # Copy the binary from the build stage
 COPY --from=builder /olake /home/olake
 
-# Sets the version of olake in ENV 
+# Sets the version of olake in ENV
 ENV DRIVER_VERSION=${DRIVER_VERSION}
 
 # Copy the pre-built JAR file from Maven

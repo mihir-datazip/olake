@@ -1,2 +1,22 @@
 .git
 test/
+.github/
+docs/
+examples/
+olake-data/
+**/testdata/
+**/.claude/
+**/logs/
+
+# local build artifact at repo root (runtime images use the maven target jar below)
+/olake-iceberg-java-writer.jar
+
+# the builder synthesizes a per-driver workspace; the repo-wide files must not leak in
+go.work
+go.work.sum
+**/go.sum
+
+# java writer sources are not needed to build driver binaries; only the built jar ships
+destination/iceberg/olake-iceberg-java-writer/**
+!destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
+destination/iceberg/local-test/
