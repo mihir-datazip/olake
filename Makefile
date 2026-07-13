@@ -88,7 +88,7 @@ docker.base.build:
 		echo "ERROR: could not read the go version from go.mod."; \
 		exit 1; \
 	fi
-	docker build --target build $(BASE_CACHE_FLAG) --build-arg GO_VERSION=$(GO_VERSION_NUM) -t olakego/base:$(BASE_IMAGE_TAG) -f base.Dockerfile .
+	DOCKER_BUILDKIT=1 docker build --target build $(BASE_CACHE_FLAG) --build-arg GO_VERSION=$(GO_VERSION_NUM) -t olakego/base:$(BASE_IMAGE_TAG) -f base.Dockerfile .
 
 # ============================================================================
 # Database, dev-build and test targets

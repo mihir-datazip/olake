@@ -12,8 +12,9 @@ env:
   MYSQL_ROOT_PASSWORD: root1234
   # Single source of truth for the drivers the integration suite covers, in run order. The first
   # package is the discover warm-up + iceberg bootstrap driver (the Bootstrap step strips it to the
-  # bare driver name).
-  INTEGRATION_TEST_PACKAGES: ./drivers/mysql/internal/... ./drivers/postgres/internal/... ./drivers/mongodb/internal/... ./drivers/mssql/internal/... ./drivers/oracle/internal/... ./drivers/db2/internal/... ./drivers/kafka/internal/...
+  # bare driver name). Paths are relative to the ./tests workspace (tests/go.work); the go test
+  # steps below run with working-directory: ./tests.
+  INTEGRATION_TEST_PACKAGES: ./mysql/... ./postgres/... ./mongodb/... ./mssql/... ./oracle/... ./db2/... ./kafka/...
 
 jobs:
   run-tests:
@@ -142,12 +143,6 @@ jobs:
           sudo chown -R 999:999 /home/runner/work/olake/olake/destination/iceberg/local-test/data
           sudo chmod -R 777 /home/runner/work/olake/olake/destination/iceberg/local-test/data
 
-      - name: Install Go Dependencies
-        run: go work sync
-
-      - name: Build Project
-        run: go build -v ./...
-
       - name: Cache Maven dependencies
         uses: actions/cache@v4
         with:
@@ -172,38 +167,25 @@ jobs:
       - name: Bootstrap Iceberg Catalog
         run: |
           set -- $INTEGRATION_TEST_PACKAGES
-          driver=${1#./drivers/}; driver=${driver%%/*}
+          driver=${1#./}; driver=${driver%%/*}
           dest=/tmp/iceberg_destination.json
           sed 's/host\.docker\.internal/127.0.0.1/g' \
-            "drivers/$driver/internal/testdata/iceberg_destination.json" > "$dest"
+            "tests/$driver/testdata/iceberg_destination.json" > "$dest"
           if ! out=$(cd "drivers/$driver" && TELEMETRY_DISABLED=true go run . check --destination "$dest" 2>&1); then
             echo "$out"; echo "::error::iceberg destination check did not succeed"; exit 1
           fi
 
-      # Discover one driver alone first: that single cold olake build compiles the shared
-      # framework once into the go-build cache, so the remaining drivers then discover in
-      # parallel reusing it instead of each rebuilding the framework at the same time.
-      # NOTE: This is a work around that will be removed in upcoming test framework revamp
-      - name: Run Discover Tests
-        if: inputs.test_type == 'integration'
-        run: |
-          set -- $INTEGRATION_TEST_PACKAGES
-          first=$1; shift
-          OLAKE_TEST_PHASE=discover go test -v -p 1 -parallel 1 "$first" -timeout 0 -run 'Integration'
-          # -p "$#": remaining drivers in parallel. -parallel 1: subtests within a package stay
-          # serial, so a driver with two formats (kafka's JSON+AVRO) doesn't race two build.sh runs
-          # on its single, bind-mounted ./olake binary ("Text file busy").
-          OLAKE_TEST_PHASE=discover go test -v -p "$#" -parallel 1 "$@" -timeout 0 -run 'Integration'
-
       - name: Run Integration Tests
         if: inputs.test_type == 'integration'
+        working-directory: ./tests
         run: |
-          OLAKE_TEST_PHASE=sync go test -v -p 7 $INTEGRATION_TEST_PACKAGES -timeout 0 -run 'Integration'
+          go test -v -p 7 $INTEGRATION_TEST_PACKAGES -timeout 0 -run 'Integration'
 
       - name: Run 2PC Integration Tests
         if: inputs.test_type == '2pc'
+        working-directory: ./tests
         run: |
-          go test -v -p 7 $INTEGRATION_TEST_PACKAGES -timeout 0 -run '2PC'
+          go test -v -p 7 $INTEGRATION_TEST_PACKAGES -timeout 0 -run Test2PC
 
       - name: Cleanup
         if: always()

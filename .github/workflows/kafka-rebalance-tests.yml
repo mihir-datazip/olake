@@ -7,7 +7,8 @@ on:
     paths:
       - 'pkg/kafka/**'
       - 'drivers/kafka/**'
-      - 'utils/testutils/test_utils.go'
+      - 'tests/kafka/**'
+      - 'tests/testutils/**'
       - '.github/workflows/kafka-rebalance-tests.yml'
   pull_request:
     branches:
@@ -15,7 +16,8 @@ on:
     paths:
       - 'pkg/kafka/**'
       - 'drivers/kafka/**'
-      - 'utils/testutils/test_utils.go'
+      - 'tests/kafka/**'
+      - 'tests/testutils/**'
       - '.github/workflows/kafka-rebalance-tests.yml'
 
 jobs:
@@ -69,12 +71,6 @@ jobs:
           sudo chown -R 999:999 /home/runner/work/olake/olake/destination/iceberg/local-test/data
           sudo chmod -R 777 /home/runner/work/olake/olake/destination/iceberg/local-test/data
 
-      - name: Install Go Dependencies
-        run: go mod download
-
-      - name: Build Project
-        run: go build -v ./...
-
       - name: Cache Maven dependencies
         uses: actions/cache@v4
         with:
@@ -88,8 +84,12 @@ jobs:
         working-directory: ./destination/iceberg/olake-iceberg-java-writer
         run: mvn clean package -DskipTests
 
+      - name: Build Test Base Image
+        run: make docker.base.build
+
       - name: Run Kafka Rebalance Tests
-        run: go test -v ./drivers/kafka/internal/... -timeout 0 -run TestKafkaRebalance
+        working-directory: ./tests
+        run: go test -v ./kafka/... -timeout 0 -run TestRebalance
 
       - name: Cleanup
         if: always()
