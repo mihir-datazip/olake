@@ -12,4 +12,5 @@ use (
 	./drivers/oracle
 	./drivers/postgres
 	./drivers/s3
+	./lib
 )

@@ -177,8 +177,10 @@ wait_ready = echo "Waiting for $(1) (up to $(or $(WAIT_RETRIES.$(1)),$(WAIT_RETR
 BUILD_DRIVERS := $(notdir $(patsubst %/go.mod,%,$(wildcard drivers/*/go.mod)))
 SOURCE_DRIVERS := $(filter $(BUILD_DRIVERS),$(notdir $(patsubst %/docker-compose.yml,%,$(wildcard drivers/*/docker-compose.yml))))
 CDC_DRIVERS := $(filter-out $(NON_CDC_DRIVERS),$(SOURCE_DRIVERS))
-INTEGRATION_PKGS := $(addsuffix /internal/...,$(addprefix ./drivers/,$(SOURCE_DRIVERS)))
-CDC_PKGS := $(addsuffix /internal/...,$(addprefix ./drivers/,$(CDC_DRIVERS)))
+# Package patterns are relative to the standalone E2E workspace (tests/go.work);
+# the test.integration/test.2pc recipes cd into tests/ before invoking go test.
+INTEGRATION_PKGS := $(addsuffix /...,$(addprefix ./,$(SOURCE_DRIVERS)))
+CDC_PKGS := $(addsuffix /...,$(addprefix ./,$(CDC_DRIVERS)))
 
 # --- source databases (generated per driver) ---------------------------------
 define SOURCE_DB_template
@@ -273,28 +275,28 @@ $(foreach d,$(BUILD_DRIVERS),$(eval $(call DEV_BUILD_template,$(d))))
 define INTEGRATION_TEST_template
 .PHONY: test.integration.$(1)
 test.integration.$(1): db.$(1).start db.destination.all.start $$(ICEBERG_JAR)
-	go test -v ./drivers/$(1)/internal/... -timeout 0 -count=1 -run 'Integration'
+	cd tests && go test -v ./$(1)/... -timeout 0 -count=1 -run 'Integration'
 endef
 $(foreach d,$(SOURCE_DRIVERS),$(eval $(call INTEGRATION_TEST_template,$(d))))
 
 define TWO_PC_TEST_template
 .PHONY: test.2pc.$(1)
 test.2pc.$(1): db.$(1).start db.destination.all.start $$(ICEBERG_JAR)
-	go test -v ./drivers/$(1)/internal/... -timeout 0 -count=1 -run '2PC'
+	cd tests && go test -v ./$(1)/... -timeout 0 -count=1 -run '2PC'
 endef
 $(foreach d,$(CDC_DRIVERS),$(eval $(call TWO_PC_TEST_template,$(d))))
 
 test.integration: db.all.start $(ICEBERG_JAR)
-	go test -v -p $(words $(SOURCE_DRIVERS)) $(INTEGRATION_PKGS) -timeout 0 -count=1 -run 'Integration'
+	cd tests && go test -v -p $(words $(SOURCE_DRIVERS)) $(INTEGRATION_PKGS) -timeout 0 -count=1 -run 'Integration'
 
 test.2pc: $(addprefix db.,$(addsuffix .start,$(CDC_DRIVERS))) db.destination.all.start $(ICEBERG_JAR)
-	go test -v -p $(words $(CDC_DRIVERS)) $(CDC_PKGS) -timeout 0 -count=1 -run '2PC'
+	cd tests && go test -v -p $(words $(CDC_DRIVERS)) $(CDC_PKGS) -timeout 0 -count=1 -run '2PC'
 
 # Unit tests across every module in the go.work workspace. Directory patterns
 # ({{.Dir}}/...), not module-path patterns: in a go.work workspace a path pattern
 # like <module>/... prefix-matches into sibling modules.
 test.unit:
-	go list -m -f '{{.Dir}}/...' | xargs go test -v -count=1 -skip 'Integration|2PC|Performance|Rebalance'
+	go list -m -f '{{.Dir}}/...' | xargs go test -v -count=1 -skip
 
 # --- help ----------------------------------------------------------------------
 help:
