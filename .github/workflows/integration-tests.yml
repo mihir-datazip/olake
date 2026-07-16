@@ -7,15 +7,279 @@ on:
     paths:
       - '**/*.go'
       - '**/*.java'
+      - '**/go.mod'
+      - 'go.work'
+      - 'Dockerfile'
+      - 'Makefile'
+      - 'drivers/*/driver.mk'
+      - '.github/workflows/integration-tests.yml'
   pull_request:
     branches:
       - "*"
     paths:
       - '**/*.go'
       - '**/*.java'
+      - '**/go.mod'
+      - 'go.work'
+      - 'Dockerfile'
+      - 'Makefile'
+      - 'drivers/*/driver.mk'
+      - '.github/workflows/integration-tests.yml'
+
+env:
+  MYSQL_ROOT_PASSWORD: root1234
 
 jobs:
+  # Single manual-approval gate for the WHOLE workflow. It's the ONLY job bound to the
+  # `integration_tests` environment (required reviewers), and every other job transitively needs it,
+  # so NOTHING -- not even detect-changes -- runs until a reviewer approves; and because it's the only
+  # gated job, one approval releases the entire run end-to-end (no downstream re-approval).
+  approve:
+    name: Approve integration tests
+    runs-on: ubuntu-latest
+    environment: integration_tests
+    steps:
+      - run: echo "Approved -- running detect-changes, warm, and the driver matrix."
+
+  # Decides which driver jobs run: a PR touching only drivers/<d>/** or tests/<d>/** runs
+  # that driver alone; shared code (root module, lib, tests/testutils, Dockerfile, Makefile)
+  # fans out to every driver. Pushes to master always run the full matrix.
+  detect-changes:
+    name: Detect changed drivers
+    needs: approve
+    runs-on: ubuntu-latest
+    outputs:
+      drivers: ${{ steps.drivers.outputs.drivers }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dorny/paths-filter@v3
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            shared: &shared
+              - 'go.work'
+              - 'go.mod'
+              - 'Dockerfile'
+              - 'Makefile'
+              - 'connector.go'
+              - 'config/**'
+              - 'constants/**'
+              - 'destination/**'
+              - 'lib/**'
+              - 'pkg/**'
+              - 'protocol/**'
+              - 'types/**'
+              - 'utils/**'
+              - 'writers/**'
+              - 'drivers/abstract/**'
+              - 'drivers/platforms.conf'
+              - 'tests/testutils/**'
+              - '.github/workflows/integration-tests.yml'
+            mysql:
+              - *shared
+              - 'drivers/mysql/**'
+              - 'tests/mysql/**'
+            postgres:
+              - *shared
+              - 'drivers/postgres/**'
+              - 'tests/postgres/**'
+            mongodb:
+              - *shared
+              - 'drivers/mongodb/**'
+              - 'tests/mongodb/**'
+            mssql:
+              - *shared
+              - 'drivers/mssql/**'
+              - 'tests/mssql/**'
+            db2:
+              - *shared
+              - 'drivers/db2/**'
+              - 'tests/db2/**'
+            oracle:
+              - *shared
+              - 'drivers/oracle/**'
+              - 'tests/oracle/**'
+            kafka:
+              - *shared
+              - 'drivers/kafka/**'
+              - 'tests/kafka/**'
+
+      - name: Resolve driver matrix
+        id: drivers
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # 'shared' is only an anchor for the per-driver filters, drop it from the matrix
+            drivers=$(echo '${{ steps.filter.outputs.changes }}' | jq -c 'map(select(. != "shared"))')
+          else
+            drivers='["mysql","postgres","mongodb","mssql","db2","oracle","kafka"]'
+          fi
+          echo "drivers=$drivers" >> "$GITHUB_OUTPUT"
+          echo "Running integration tests for: $drivers"
+
+  # One runner warms everything the matrix consumes (instead of three parallel warm jobs):
+  #  - the Iceberg writer jar (FATAL -- every driver job downloads it as an artifact);
+  #  - the base apt layer (base.Dockerfile), matched by the driver runtime stage's apt-get.
+  # The apt cache warm is best-effort so a miss never blocks tests. Destination images are NOT cached:
+  # for multi-GB images (Spark) a save/load tarball is slower than a registry pull, so the matrix just
+  # pulls them non-blocking, overlapped with the build.
+  warm:
+    name: Warm caches + build jar
+    needs: approve
+    runs-on: 16gb-runner
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Java for Maven
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Raw `docker buildx --cache-to/--cache-from type=gha` reads the Actions cache token from the
+      # env, which self-hosted runners don't export by default -- without this buildx silently
+      # caches nothing (the apt layer re-runs). Exposes ACTIONS_CACHE_URL/RUNTIME_TOKEN.
+      - name: Expose GitHub Actions cache token
+        uses: crazy-max/ghaction-github-runtime@v3
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # The jar build and the apt cache warm are independent, so run them CONCURRENTLY on this one
+      # runner (backgrounded, then waited). The jar is FATAL -- every driver downloads it as an
+      # artifact -- so its exit status fails the step; the apt cache warm is best-effort (a miss just
+      # means the matrix build redoes that apt-get), so its failure is swallowed.
+      - name: Build jar + warm caches (parallel)
+        run: |
+          set -euo pipefail
+          make iceberg.jar & jar=$!
+          ( docker buildx build -f base.Dockerfile \
+              --cache-to type=gha,mode=max,scope=olake-base --cache-from type=gha,scope=olake-base . \
+              || echo "::warning::apt cache warm failed (non-fatal)" ) & apt=$!
+          wait "$apt"      # best-effort: subshell swallows failures, so this never fails
+          wait "$jar"      # FATAL: set -e fails the step if the jar build failed
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: iceberg-writer-jar
+          path: destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
+          if-no-files-found: error
+          retention-days: 1
+
+  # Self-contained -- ONE job per driver via the matrix. On the ephemeral runner
+  # pool each job is a fresh VM with its own Docker daemon, so nothing is shared
+  # across jobs: every job brings up its own source + destination and builds its
+  # own image. Drivers run in parallel as N independent VMs. No teardown -- the VM
+  # is discarded when the job ends.
   integration-tests:
-    uses: ./.github/workflows/integration-tests-runner.yml
-    with:
-      test_type: integration
+    name: ${{ fromJSON('{"mysql":"MySQL","postgres":"PostgreSQL","mongodb":"MongoDB","mssql":"SQL Server","db2":"IBM Db2","oracle":"Oracle","kafka":"Kafka"}')[matrix.driver] }}
+    needs: [detect-changes, warm]
+    if: needs.detect-changes.outputs.drivers != '[]'
+    runs-on: 16gb-runner
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: ${{ fromJSON(needs.detect-changes.outputs.drivers) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Start the source + destination stacks FIRST (non-blocking `compose up -d`) so their images
+      # pull and containers boot in the background through Go/buildx setup, the jar download and the
+      # image build -- fully hiding the destination pull. (Caching these multi-GB images as a
+      # save/load tarball was slower than this overlapped pull.) Readiness is checked further below.
+      - name: Start containers
+        run: make db.${{ matrix.driver }}.up db.destination.all.up
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: "go.mod"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Raw `docker buildx --cache-to/--cache-from type=gha` reads the Actions cache token from the
+      # env, which self-hosted runners don't export by default -- without this buildx silently
+      # caches nothing (the apt layer re-runs). Exposes ACTIONS_CACHE_URL/RUNTIME_TOKEN.
+      - name: Expose GitHub Actions cache token
+        uses: crazy-max/ghaction-github-runtime@v3
+
+      # Place the jar where the Dockerfile copies it from (built once by the warm job).
+      - name: Download Iceberg writer jar
+        uses: actions/download-artifact@v4
+        with:
+          name: iceberg-writer-jar
+          path: destination/iceberg/olake-iceberg-java-writer/target/
+
+      # buildx so the runtime apt-get layer is a --cache-from hit off the GHA cache the warm job
+      # populated via base.Dockerfile; --load puts the built image in the local store for the
+      # check + tests below. The Go build layers still build cold (they change every commit).
+      - name: Build driver image
+        run: make docker.build.${{ matrix.driver }} DOCKER_BUILD="docker buildx build --cache-from type=gha,scope=olake-base --load"
+
+      # Block on readiness (and mssql's one-time init) now, after the image build
+      # gave the containers time to come up. Probes live in drivers/<d>/driver.mk.
+      - name: Wait for infrastructure
+        run: make db.${{ matrix.driver }}.wait db.destination.all.wait
+
+      # Bootstrap this job's Iceberg JdbcCatalog ONCE, serially, before the tests: olake
+      # processes reaching a freshly created catalog concurrently race each other's
+      # CREATE TABLE on the catalog bookkeeping tables (iceberg_tables,
+      # iceberg_namespace_properties). The harness has no runtime fallback for this race,
+      # so this step is what guarantees an initialized catalog.
+      - name: Check destination (bootstrap Iceberg catalog)
+        run: |
+          set -euo pipefail
+          host_dir="tests/${{ matrix.driver }}/testdata"
+          cfg=$(find "$host_dir" -name iceberg_destination.json | head -1)
+          rel=${cfg#"$host_dir/"}
+          echo "Bootstrapping Iceberg catalog via '${{ matrix.driver }}' ($rel)..."
+          docker run --rm \
+            -v "$PWD/$host_dir:/testdata" \
+            --add-host host.docker.internal:host-gateway \
+            -e TELEMETRY_DISABLED=true \
+            "olake/source-${{ matrix.driver }}:local" \
+            check --destination "/testdata/$rel"
+
+      # db2's test binary links the CGO go_ibm_db driver (it runs setup SQL against db2), so the
+      # runner needs the IBM clidriver headers/libs to COMPILE tests/db2. Install it (same
+      # installer the driver build uses) and export the CGO env for the test step below. amd64
+      # only -- IBM ships no arm64 clidriver, and the matrix runs on amd64.
+      - name: Set up DB2 clidriver
+        if: matrix.driver == 'db2'
+        run: |
+          set -euxo pipefail
+          cli_root="$RUNNER_TEMP/db2-clidriver"
+          mkdir -p "$cli_root"
+          go run github.com/ibmdb/go_ibm_db/installer@v0.4.5 "$cli_root"
+          cli="$cli_root/clidriver"
+          {
+            echo "CGO_ENABLED=1"
+            echo "IBM_DB_HOME=$cli"
+            echo "CGO_CFLAGS=-I$cli/include"
+            echo "CGO_LDFLAGS=-L$cli/lib -Wl,-rpath,$cli/lib"
+            echo "LD_LIBRARY_PATH=$cli/lib"
+          } >> "$GITHUB_ENV"
+
+      # Integration, 2PC and (for kafka) Rebalance run as separate tests in this
+      # single flow; Performance needs external infra and runs in its own workflow.
+      - name: Run Integration Tests
+        working-directory: ./tests/${{ matrix.driver }}
+        env:
+          OLAKE_DRIVER_IMAGE: olake/source-${{ matrix.driver }}:local
+        run: go test -v ./... -timeout 0 -skip 'Performance'

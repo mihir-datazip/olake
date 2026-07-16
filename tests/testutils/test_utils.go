@@ -1255,13 +1255,6 @@ func (cfg *IntegrationTest) TestRebalance(t *testing.T) {
 	})
 }
 
-func skipOutsideTestPhase(t *testing.T, phase string) {
-	t.Helper()
-	if v := os.Getenv("OLAKE_TEST_PHASE"); v != "" && v != phase {
-		t.Skipf("OLAKE_TEST_PHASE=%s: skipping %s subtest", v, phase)
-	}
-}
-
 func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 	ctx := context.Background()
 	cfg.ExecuteQuery = timedExecuteQuery(cfg.TestConfig.Driver, cfg.ExecuteQuery)
@@ -1271,7 +1264,6 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 	currentTestTable := utils.Ternary(cfg.TestConfig.DataFormat == "", fmt.Sprintf("%s_test_table_olake", cfg.TestConfig.Driver), fmt.Sprintf("%s_%s_test_table_olake", cfg.TestConfig.Driver, cfg.TestConfig.DataFormat)).(string)
 
 	t.Run("Discover", func(t *testing.T) {
-		skipOutsideTestPhase(t, "discover")
 		// 1. Query on test table
 		cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "create", false)
 		cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "clean", false)
@@ -1303,7 +1295,6 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 	})
 
 	t.Run("Sync", func(t *testing.T) {
-		skipOutsideTestPhase(t, "sync")
 		// 1. Query on test table
 		cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "create", false)
 		cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "clean", false)

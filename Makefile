@@ -35,34 +35,18 @@ prepare.%:
 build.%:
 	CGO_ENABLED=0 go build -C drivers/$* -o $(OUTPUT) main.go
 
-BASE_NO_CACHE ?=
-BASE_CACHE_FLAG = $(if $(BASE_NO_CACHE),--no-cache --pull)
-GO_VERSION_NUM = $(shell echo $(GO_VERSION) | sed 's/go//')
-
-BASE_IMAGE_TAG ?= build-$(GO_VERSION)
-BASE_IMAGE ?= olakego/base:$(BASE_IMAGE_TAG)
-
-# Queried by CI (integration-tests-runner.yml) to run the bootstrap check in the base image.
-.PHONY: print.base-image
-print.base-image:
-	@echo $(BASE_IMAGE)
-
-.PHONY: docker.base.build
-docker.base.build:
-	@if [ -z "$(strip $(GO_VERSION_NUM))" ]; then \
-		echo "ERROR: could not read the go version from go.mod."; \
-		exit 1; \
-	fi
-	DOCKER_BUILDKIT=1 docker build --target build $(BASE_CACHE_FLAG) --build-arg GO_VERSION=$(GO_VERSION_NUM) -t $(BASE_IMAGE) -f base.Dockerfile .
-
-
 # Build a driver image locally, e.g. `make docker.build.postgres IMAGE_TAG=v1.2.3`.
 # Drivers with an explicit entry in drivers/platforms.conf are pinned to it.
 # Concrete (non-pattern) targets so they are phony and shells can autocomplete them.
 IMAGE_TAG ?= local
+# DOCKER_BUILD lets CI add buildx + a shared layer cache without changing local behaviour: the
+# integration workflow sets it to a buildx build that --cache-from the GHA layer cache warmed by
+# base.Dockerfile (whose runtime steps mirror this image's), so the apt-get layer is a cache hit.
+# Locally it stays a plain `docker build`.
+DOCKER_BUILD ?= docker build
 .PHONY: $(addprefix docker.build.,$(DRIVERS))
 $(addprefix docker.build.,$(DRIVERS)): docker.build.%:
-	docker build $(addprefix --platform ,$(call local_driver_platforms,$*)) --build-arg DRIVER_NAME=$* -t olake/source-$*:$(IMAGE_TAG) .
+	$(DOCKER_BUILD) $(addprefix --platform ,$(call local_driver_platforms,$*)) --build-arg DRIVER_NAME=$* -t olake/source-$*:$(IMAGE_TAG) .
 
 gomod:
 	find . -name go.mod -execdir go mod tidy \;
@@ -183,12 +167,22 @@ INTEGRATION_PKGS := $(addsuffix /...,$(addprefix ./,$(SOURCE_DRIVERS)))
 CDC_PKGS := $(addsuffix /...,$(addprefix ./,$(CDC_DRIVERS)))
 
 # --- source databases (generated per driver) ---------------------------------
+# up/wait split: `up` only runs `compose up -d` (non-blocking) so CI can start
+# every container early and build the jar/image while they boot; `wait` blocks
+# on readiness (and one-time init) right before the tests run. start = up + wait,
+# sequenced via sub-make so `make -j` can't probe before the up has been issued.
 define SOURCE_DB_template
-.PHONY: db.$(1).start db.$(1).stop db.$(1).teardown db.$(1).restart db.$(1).refresh
-db.$(1).start:
+.PHONY: db.$(1).up db.$(1).wait db.$(1).start db.$(1).stop db.$(1).teardown db.$(1).restart db.$(1).refresh
+db.$(1).up:
 	$$(COMPOSE) -f drivers/$(1)/docker-compose.yml up -d
+
+db.$(1).wait:
 	@$$(call wait_ready,$(1))
 	@$$(POST_SETUP.$(1))
+
+db.$(1).start:
+	@$$(MAKE) --no-print-directory db.$(1).up
+	@$$(MAKE) --no-print-directory db.$(1).wait
 
 db.$(1).stop:
 	$$(COMPOSE) -f drivers/$(1)/docker-compose.yml down --remove-orphans
@@ -219,11 +213,18 @@ db.source.all.refresh:
 	@$(MAKE) --no-print-directory db.source.all.start
 
 # --- destination stack --------------------------------------------------------
-db.destination.all.start:
+# Same up/wait split as the source stacks (see SOURCE_DB_template).
+db.destination.all.up:
 	mkdir -p $(DEST_DATA_DIR)/minio-data $(DEST_DATA_DIR)/postgres-data $(DEST_DATA_DIR)/ivy-cache
 	$(COMPOSE) -f $(DEST_COMPOSE) up -d $(DEST_SERVICES)
+
+db.destination.all.wait:
 	@$(call wait_ready,minio)
 	@$(call wait_ready,spark)
+
+db.destination.all.start:
+	@$(MAKE) --no-print-directory db.destination.all.up
+	@$(MAKE) --no-print-directory db.destination.all.wait
 
 db.destination.all.stop:
 	$(COMPOSE) -f $(DEST_COMPOSE) down --remove-orphans
@@ -260,6 +261,10 @@ $(ICEBERG_JAR): $(ICEBERG_JAR_SRCS)
 		docker run --rm -v "$(CURDIR)/$(ICEBERG_WRITER_DIR)":/build -v olake-m2-cache:/root/.m2 -w /build $(MVN_IMAGE) mvn clean package -Dmaven.test.skip=true; \
 	fi
 	cp $(ICEBERG_JAR) $(ROOT_JAR)
+
+# Phony alias so CI (and humans) can `make iceberg.jar` without knowing the file path.
+.PHONY: iceberg.jar
+iceberg.jar: $(ICEBERG_JAR)
 
 # --- dev builds (generated per driver, incl. s3) ------------------------------
 define DEV_BUILD_template
@@ -308,7 +313,9 @@ help:
 	@printf "  %-44s %s\n" "gomod / golangci / trivy / gofmt / pre-commit" "tidy, lint, format and git-hook targets"
 	@echo ""
 	@echo "Source databases (compose up + wait until ready; stop keeps volumes):"
-	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "db.$(d).start" "start + wait for $(d)";)
+	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "db.$(d).up" "compose up -d only, non-blocking";)
+	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "db.$(d).wait" "block until $(d) is ready (+ one-time init)";)
+	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "db.$(d).start" "start + wait for $(d) (= up + wait)";)
 	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "db.$(d).stop" "stop $(d) (keep volumes + data)";)
 	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "db.$(d).teardown" "stop $(d) + remove volumes";)
 	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "db.$(d).restart" "stop then start $(d) (keep data)";)
@@ -316,6 +323,7 @@ help:
 	@printf "  %-44s %s\n" "db.source.all.<verb>" "verb = start|stop|teardown|restart|refresh, all source DBs (make -j8)"
 	@echo ""
 	@echo "Destination stack (minio + mc + iceberg catalog + spark-connect):"
+	@printf "  %-44s %s\n" "db.destination.all.up|wait" "non-blocking up / block until ready"
 	@printf "  %-44s %s\n" "db.destination.all.start|stop" "the iceberg/parquet test stack"
 	@printf "  %-44s %s\n" "db.destination.all.restart" "stop then start (keep data)"
 	@printf "  %-44s %s\n" "db.destination.all.teardown" "down --volumes + DELETE $(DEST_DATA_DIR)"
@@ -327,9 +335,9 @@ help:
 	@echo ""
 	@echo "Docker images:"
 	@$(foreach d,$(DRIVERS),printf "  %-44s %s\n" "docker.build.$(d)" "build the $(d) driver image (olake/source-$(d):$(IMAGE_TAG))";)
-	@printf "  %-44s %s\n" "docker.base.build" "build the base toolchain image ($(BASE_IMAGE))"
 	@echo ""
 	@echo "Tests (auto-provision the databases they need):"
+	@printf "  %-44s %s\n" "iceberg.jar" "build the Iceberg writer JAR (skips maven when up to date)"
 	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "test.integration.$(d)" "integration suite for $(d)";)
 	@$(foreach d,$(CDC_DRIVERS),printf "  %-44s %s\n" "test.2pc.$(d)" "2PC recovery suite for $(d)";)
 	@printf "  %-44s %s\n" "test.integration | test.2pc | test.unit" "aggregate runs (CI-equivalent)"
@@ -338,6 +346,7 @@ help:
 
 .PHONY: lint build \
 	db.source.all.start db.source.all.stop db.source.all.teardown db.source.all.restart db.source.all.refresh \
+	db.destination.all.up db.destination.all.wait \
 	db.destination.all.start db.destination.all.stop db.destination.all.teardown db.destination.all.restart db.destination.all.refresh \
 	db.all.start db.all.stop db.all.teardown db.all.restart db.all.refresh \
 	test.integration test.2pc test.unit help

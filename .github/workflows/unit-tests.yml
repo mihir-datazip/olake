@@ -29,4 +29,5 @@ jobs:
 
       - name: Run All Unit Tests
         run: |
+          # the tests/ tree is its own workspace and only runs in the per-driver integration workflow
           go list -m | awk '{print $1"/..."}' | xargs go test -v -count=1 -skip 'Integration|2PC|Performance|Rebalance'
