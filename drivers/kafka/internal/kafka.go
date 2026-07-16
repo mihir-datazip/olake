@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"slices"
 	"sync"
+	"time"
 
 	kafkapkg "github.com/datazip-inc/olake/pkg/kafka"
 	kafkaplain "github.com/twmb/franz-go/pkg/sasl/plain"
@@ -252,6 +253,11 @@ func (k *Kafka) ProduceSchema(ctx context.Context, streamID types.StreamID) (*ty
 func (k *Kafka) createDialer() ([]kgo.Opt, error) {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(utils.SplitAndTrim(k.config.BootstrapServers)...),
+		// A Kafka consumer only picks up newly-added partitions on a metadata refresh, and
+		// franz-go defaults MetadataMaxAge to 5m -- so a sync that must consume a partition added
+		// mid-stream (topic scale-up) stalls ~5m waiting for the refresh. Refresh far more often
+		// so new partitions are consumed in seconds.
+		kgo.MetadataMaxAge(15 * time.Second),
 	}
 
 	// Parse SASL credentials
