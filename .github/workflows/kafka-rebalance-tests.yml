@@ -88,8 +88,10 @@ jobs:
         working-directory: ./destination/iceberg/olake-iceberg-java-writer
         run: mvn clean package -DskipTests
 
-      - name: Build Test Base Image
-        run: make docker.base.build
+      # The harness runs the kafka driver as its real docker image; the iceberg writer
+      # jar must exist first — the Dockerfile COPYs it into the image.
+      - name: Build Driver Image
+        run: make docker.build.kafka
 
       - name: Run Kafka Rebalance Tests
         working-directory: ./tests

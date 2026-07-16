@@ -1,2 +1,7 @@
 .git
 test/
+# Runtime data written by the local Iceberg destination stack (compose bind
+# mounts). It is root/uid-owned (postgres PGDATA is mode 700) and never a build
+# input, so keep it out of the `docker build .` context -- otherwise the context
+# sender fails with "permission denied" reading it.
+destination/iceberg/local-test/data
