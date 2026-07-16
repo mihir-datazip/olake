@@ -10,6 +10,7 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -211,8 +212,13 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
     private Table loadOrCreateTable(TableIdentifier tableId, Schema schema, List<Map<String, String>> partitionTransforms) {
         return IcebergUtil.loadIcebergTable(icebergCatalog, tableId).orElseGet(() -> {
             try {
-                // no need to check if the table already exists, because the table is created by the thread that calls the get_or_create_table method
                 return IcebergUtil.createIcebergTable(icebergCatalog, tableId, schema, "parquet", partitionTransforms);
+            } catch (AlreadyExistsException e) {
+                // Another writer created the table concurrently -- parallel sync processes
+                // share one catalog, so a load-miss followed by create can race. The table
+                // now exists; load and use it instead of failing the request.
+                return IcebergUtil.loadIcebergTable(icebergCatalog, tableId).orElseThrow(() ->
+                        new DebeziumException("Table reported as already existing but could not be loaded: " + tableId, e));
             } catch (Exception e) {
                 String errorMessage = String.format("Failed to create table from debezium event schema: %s Error: %s",
                                                     tableId, e.getMessage());
