@@ -292,7 +292,9 @@ func verifyDiscoveredStreams(t *testing.T, expectedPath, actualPath string) {
 
 // seedCatalogFromTestStreams writes test_streams.json out as the suite's catalog, renaming the
 // stream to this suite's table. The fixture names the unsuffixed table, so without the rename a
-// suffixed suite would sync a stream that does not exist.
+// suffixed suite would sync a stream that does not exist. It also suffixes destination_database so
+// the suite writes to its OWN Iceberg namespace (see the inline note below) -- the fixture's baked
+// value would otherwise put every suite in one namespace, where concurrent syncs collide on it.
 //
 // Field-by-field rather than a text substitution, because the two identifiers do not share a
 // spelling: stream names follow the SOURCE's casing (oracle and db2 are SkipCDCDrivers, so
@@ -329,6 +331,17 @@ func seedCatalogFromTestStreams(t *testing.T, c *TestConfig, testTable string) {
 			}
 			if stream["destination_table"] == base {
 				stream["destination_table"] = testTable
+			}
+			// Isolate this suite's Iceberg namespace from the integration suite's. The fixture bakes a
+			// destination_database ("<db>:<namespace>", e.g. "db2_testdb:db2inst1") that the sync uses
+			// verbatim -- once destination_database is set, --destination-database-prefix is ignored --
+			// so without this both suites resolve to the SAME namespace and their concurrent syncs race
+			// its CREATE (createNamespace duplicate-key, or a double-committed full-refresh). Append the
+			// suite; the namespace resolves ':'->'_', so this becomes "..._db2inst1_2pc". The suite's
+			// cfg.DestinationDB is suffixed identically (see Test2PCIntegration) so verify/drop hit the
+			// same namespace the sync wrote to.
+			if ddb, ok := stream["destination_database"].(string); ok && ddb != "" {
+				stream["destination_database"] = ddb + "_" + c.Suite
 			}
 		}
 		byNamespace, _ := doc["selected_streams"].(map[string]interface{})
@@ -1376,6 +1389,10 @@ func (cfg *IntegrationTest) testIceberg2PCIncrementalRecovery(
 // reported separately.
 func (cfg *IntegrationTest) Test2PCIntegration(t *testing.T) {
 	applySuite(t, cfg.TestConfig, "2pc")
+	// Match the per-suite destination_database seedCatalogFromTestStreams appends: the sync writes to
+	// "<ns>_2pc", so verify/drop (which read cfg.DestinationDB) must target the same -- otherwise they
+	// look in the integration suite's "<ns>" and the two concurrent suites collide on it again.
+	cfg.DestinationDB = cfg.DestinationDB + "_" + cfg.TestConfig.Suite
 	ctx := context.Background()
 	cfg.ExecuteQuery = timedExecuteQuery(cfg.TestConfig.Driver, cfg.ExecuteQuery)
 
@@ -1515,6 +1532,9 @@ func (cfg *IntegrationTest) testKafkaRebalance(
 // TestRebalance runs the Kafka consumer-group rebalance recovery integration test in an isolated container.
 func (cfg *IntegrationTest) TestRebalance(t *testing.T) {
 	applySuite(t, cfg.TestConfig, "rebalance")
+	// Suffix the destination namespace to match the seed's per-suite destination_database, as
+	// Test2PCIntegration does.
+	cfg.DestinationDB = cfg.DestinationDB + "_" + cfg.TestConfig.Suite
 	ctx := context.Background()
 
 	t.Logf("Root Project directory: %s", cfg.TestConfig.HostRootPath)

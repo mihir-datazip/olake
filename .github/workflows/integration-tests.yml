@@ -120,7 +120,7 @@ jobs:
           echo "Running integration tests for: $drivers"
 
   # One runner warms everything the matrix consumes (instead of three parallel warm jobs):
-  #  - the Iceberg writer jar (FATAL -- every driver job downloads it as an artifact), cached on its
+  #  - the Iceberg writer jar (FATAL -- every driver job restores it from this cache), keyed on its
   #    own sources so an unchanged writer skips Maven entirely;
   #  - the base apt layer (base.Dockerfile), matched by the driver runtime stage's apt-get.
   # The apt cache warm is best-effort so a miss never blocks tests. Destination images are NOT cached:
@@ -193,8 +193,6 @@ jobs:
       # continue-on-error on the wait instead would swallow a jar failure too, and every driver
       # depends on the jar.
       - name: Warm base apt layer
-        id: apt-warm
-        background: true
         run: |
           docker buildx build -f base.Dockerfile --target runtime \
             --cache-to type=gha,mode=max,scope=olake-base --cache-from type=gha,scope=olake-base . \
@@ -204,15 +202,7 @@ jobs:
       # wait-all joins whatever is actually running instead of naming a step that never started.
       # A jar build failure fails the job here.
       - name: Wait for jar and apt warm
-        wait-all:
-
-      - name: Upload jar
-        uses: actions/upload-artifact@v4
-        with:
-          name: iceberg-writer-jar
-          path: destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
-          if-no-files-found: error
-          retention-days: 1
+        wait: jar
 
   # Self-contained -- ONE job per driver via the matrix. On the ephemeral runner
   # pool each job is a fresh VM with its own Docker daemon, so nothing is shared
@@ -249,21 +239,13 @@ jobs:
           # "no go.sum" warning; the explicit cache below replaces it, keyed on go.mod instead.
           cache: false
 
-      # THE reason "Install Dependencies" is ~90s cold instead of ~1s. Without a persisted cache the
-      # step re-downloads ~330MB of modules and recompiles ~47 CPU-seconds across 467 packages every
-      # run (measured: warm it is 0.7s). Each matrix job is a fresh VM, so nothing survives on its
-      # own -- this is what carries the module and build caches between runs.
-      #
-      # Keyed on the go.mod files, which are tracked and change rarely, rather than go.sum which does
-      # not exist. hashFiles over every module's go.mod means any dependency bump invalidates it; the
-      # restore-keys give a warm-ish start (stale objects are just recompiled) when only one changed.
       - name: Cache Go modules + build
         uses: actions/cache@v4
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ matrix.driver }}-${{ hashFiles('**/go.mod') }}
+          key: ${{ runner.os }}-go-${{ matrix.driver }}-${{ hashFiles('lib/**/go.mod', 'tests/testutils/go.mod', format('tests/{0}/go.mod', matrix.driver)) }}
           restore-keys: |
             ${{ runner.os }}-go-${{ matrix.driver }}-
             ${{ runner.os }}-go-
@@ -284,12 +266,17 @@ jobs:
       - name: Expose GitHub Actions cache token
         uses: crazy-max/ghaction-github-runtime@v3
 
-      # Place the jar where the Dockerfile copies it from (built once by the warm job).
-      - name: Download Iceberg writer jar
-        uses: actions/download-artifact@v4
+      # Restore the jar the warm job built and cached, straight from the GHA cache -- no artifact
+      # round-trip. Keyed identically to the warm job's jar cache; the warm job's post-job save runs
+      # before this job starts (we need: warm), so the entry exists. fail-on-cache-miss: a miss means
+      # the warm cache was evicted, which must fail loudly here -- the Dockerfile COPYs this jar and
+      # the driver jobs have no Maven to rebuild it -- rather than surface as a confusing build error.
+      - name: Restore Iceberg writer jar
+        uses: actions/cache/restore@v4
         with:
-          name: iceberg-writer-jar
-          path: destination/iceberg/olake-iceberg-java-writer/target/
+          path: destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
+          key: ${{ runner.os }}-iceberg-jar-${{ hashFiles('destination/iceberg/olake-iceberg-java-writer/pom.xml', 'destination/iceberg/olake-iceberg-java-writer/src/**') }}
+          fail-on-cache-miss: true
 
       # No --cache-to, on measured evidence: exporting this build's cache to GHA cost ~119s (18.5s
       # "preparing build cache for export" + 100.2s sending, of which two layers -- the 362MB jar and
@@ -310,9 +297,8 @@ jobs:
       - name: Wait for background jobs
         wait: [containers, go-build]
 
-
-      - name: Wait for destination readiness
-        run: make db.destination.all.wait
+      - name: Wait for source + destination readiness
+        run: make -j2 --output-sync=target db.${{ matrix.driver }}.wait db.destination.all.wait
 
       # Bootstrap this job's Iceberg JdbcCatalog ONCE, serially, before the tests: olake
       # processes reaching a freshly created catalog concurrently race each other's
