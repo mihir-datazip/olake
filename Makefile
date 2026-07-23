@@ -55,8 +55,9 @@ GO_VERSION_NUM = $(shell echo $(GO_VERSION) | sed 's/go//')
 
 BASE_IMAGE_TAG ?= build-$(GO_VERSION)
 BASE_IMAGE ?= olakego/base:$(BASE_IMAGE_TAG)
+BASE_RUNTIME_IMAGE ?= olakego/base:runtime
 
-# Queried by CI (integration-tests-runner.yml) to run the bootstrap check in the base image.
+# The tag of the build stage, for anything that wants to run inside it directly.
 .PHONY: print.base-image
 print.base-image:
 	@echo $(BASE_IMAGE)
@@ -65,8 +66,7 @@ print.base-image:
 # the host platform by default rather than the release set in drivers/platforms.conf: a build for
 # two platforms at once produces an image index, which only the containerd image store can hold,
 # and the GitHub runners still use the classic one. Pass PLATFORMS=<single platform> to cross-build
-# it -- what the harness does for drivers that pin ContainerRequest.ImagePlatform (see
-# ensureTestBaseImage).
+# it.
 .PHONY: docker.base.build
 docker.base.build:
 	@if [ -z "$(strip $(GO_VERSION_NUM))" ]; then \
@@ -74,6 +74,7 @@ docker.base.build:
 		exit 1; \
 	fi
 	docker build $(addprefix --platform ,$(PLATFORMS)) --target build $(BASE_CACHE_FLAG) --build-arg GO_VERSION=$(GO_VERSION_NUM) -t $(BASE_IMAGE) -f base.Dockerfile .
+	docker build $(addprefix --platform ,$(PLATFORMS)) --target runtime $(BASE_CACHE_FLAG) -t $(BASE_RUNTIME_IMAGE) -f base.Dockerfile .
 
 # Mirrors CI's "Go Build and Lint" workflow (.github/workflows/golang-ci.yml):
 # its lint job installs golangci-lint via `go install ...@latest` and runs it
@@ -181,6 +182,12 @@ SOURCE_DRIVERS := $(filter $(DRIVERS),$(notdir $(patsubst %/docker-compose.yml,%
 CDC_DRIVERS := $(filter-out $(NON_CDC_DRIVERS),$(SOURCE_DRIVERS))
 INTEGRATION_PKGS := $(addsuffix /...,$(addprefix ./,$(SOURCE_DRIVERS)))
 CDC_PKGS := $(addsuffix /...,$(addprefix ./,$(CDC_DRIVERS)))
+
+# The drivers the integration suites cover, queried by CI (integration-tests-runner.yml) so the
+# list lives in this file only. CI bootstraps the shared iceberg catalog with the first of them.
+.PHONY: print.source-drivers
+print.source-drivers:
+	@echo $(SOURCE_DRIVERS)
 
 # --- prepare ------------------------------------------------------------------
 # prepare.<d> provisions whatever driver d needs before it can compile; the

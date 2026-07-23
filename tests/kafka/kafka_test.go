@@ -87,9 +87,7 @@ func TestKafkaIntegration(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			// Had to remove parallelism here as concurrent discover throws error
-			// /test-olake/build.sh: line 23: ./olake: Text file busy
-			// t.Parallel()
+			t.Parallel()
 			test.cfg.TestIntegration(t)
 		})
 	}

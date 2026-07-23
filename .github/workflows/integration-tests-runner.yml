@@ -71,26 +71,25 @@ jobs:
         working-directory: ./destination/iceberg/olake-iceberg-java-writer
         run: mvn clean package -DskipTests
 
-      - name: Build Test Base Image
-        run: make docker.base.build
-
       # The sync suites run many olake processes concurrently, and the first to reach a freshly
       # created iceberg JdbcCatalog race each other's CREATE TABLE on the shared catalog bookkeeping
       # tables (iceberg_tables, iceberg_namespace_properties). Bootstrap it once, serially, before
       # any tests run, so every later sync finds it initialized. The catalog is shared across all
-      # drivers, so one check with any single driver suffices.
+      # drivers, so one check (the first of SOURCE_DRIVERS, the same list the test targets run)
+      # suffices. The check runs the very artifact the tests exercise, the driver's real docker
+      # image, and serially building that one image here also warms the shared BuildKit layers for
+      # the driver images the tests build lazily.
       - name: Bootstrap Iceberg Catalog
         run: |
+          set -- $(make -s print.source-drivers)
+          driver=$1
+          make docker.$driver.build
           docker run --rm \
             --add-host host.docker.internal:host-gateway \
-            -v "$PWD:/test-olake" \
-            -v go-mod:/go/pkg/mod \
-            -v go-build:/root/.cache/go-build \
-            -w /test-olake \
+            -v "$PWD/tests/$driver/testdata:/testdata" \
             -e TELEMETRY_DISABLED=true \
-            -e OLAKE_SKIP_MOD_TIDY=1 \
-            "$(make -s print.base-image)" \
-            ./build.sh driver-mysql check --destination /test-olake/tests/mysql/testdata/iceberg_destination.json
+            "olake/source-$driver:local" \
+            check --destination /testdata/iceberg_destination.json
 
       # test.integration / test.2pc run every driver's suite in parallel from the
       # tests workspace (-p <driver count>), with the per-driver cgo env applied.
