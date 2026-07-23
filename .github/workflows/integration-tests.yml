@@ -150,7 +150,28 @@ jobs:
       - name: Expose GitHub Actions cache token
         uses: crazy-max/ghaction-github-runtime@v3
 
+      # The warm job no longer USES the jar (the drivers restore it from the cache themselves), so all
+      # it needs here is whether the jar is already cached -- lookup-only checks existence and sets
+      # cache-hit WITHOUT downloading the 362MB jar. It runs BEFORE the Maven cache and the build so
+      # both can gate on its result; on a miss the build produces the jar and the save step at the end
+      # of the job uploads it under this key.
+      #
+      # Deliberately NO restore-keys: cache-hit is 'true' only on an EXACT key match (pom.xml + src/**),
+      # so a changed writer misses and rebuilds. A fallback key would report a stale jar as a hit and
+      # every driver would test against writer code that does not match this branch.
+      - name: Look up Iceberg writer jar cache
+        id: jar-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
+          key: ${{ runner.os }}-iceberg-jar-${{ hashFiles('destination/iceberg/olake-iceberg-java-writer/pom.xml', 'destination/iceberg/olake-iceberg-java-writer/src/**') }}
+          lookup-only: true
+
+      # ~/.m2 only matters when the jar is actually (re)built below -- on a jar-cache HIT mvn never
+      # runs, so restoring (and maybe re-saving) ~/.m2 is pure wasted transfer. Gate it on the jar
+      # cache miss so it is skipped, exactly like the build, whenever the writer is unchanged.
       - name: Cache Maven dependencies
+        if: steps.jar-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -159,29 +180,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      # Cache the built jar itself, so an unchanged writer skips Maven entirely instead of rebuilding
-      # it every run (the ~/.m2 cache above only makes that rebuild faster). The key is exactly the
-      # $(ICEBERG_JAR) prerequisites in the Makefile -- pom.xml plus src/** -- so any writer change
-      # misses and rebuilds.
-      #
-      # Deliberately NO restore-keys, unlike the Maven cache above: a partial hit on ~/.m2 is still
-      # useful, but a fallback key here would hand back a jar built from DIFFERENT Java sources and
-      # every driver would then test against stale writer code. Exact match or rebuild.
-      - name: Cache Iceberg writer jar
-        id: jar-cache
-        uses: actions/cache@v4
-        with:
-          path: destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
-          key: ${{ runner.os }}-iceberg-jar-${{ hashFiles('destination/iceberg/olake-iceberg-java-writer/pom.xml', 'destination/iceberg/olake-iceberg-java-writer/src/**') }}
-
-      # The jar build and the apt cache warm are independent, so they run CONCURRENTLY as background
-      # steps on this one runner.
-      #
-      # Skipped outright on a cache hit -- not left to make. `make iceberg.jar` is a file target, so a
-      # restored jar with an mtime newer than the checked-out sources would make it print "up to date"
-      # and skip Maven anyway, but that depends on cache-restore mtimes landing after checkout mtimes,
-      # which nothing guarantees. The `if` is what makes it deterministic. It also has to skip: the
-      # recipe runs `mvn clean package`, and clean would delete the jar we just restored.
+      # Runs in the background, overlapping the apt warm below. Gated on the lookup miss above: on a
+      # hit the jar is already cached (and the lookup did not download it), so there is nothing to
+      # build -- and since the jar is NOT on disk here, only the `if` prevents `make iceberg.jar` from
+      # rebuilding it. On a miss `mvn clean package` produces it, and the save step at the end uploads
+      # it under the same key.
       - name: Build Iceberg writer jar
         id: jar
         if: steps.jar-cache.outputs.cache-hit != 'true'
@@ -203,6 +206,17 @@ jobs:
       # A jar build failure fails the job here.
       - name: Wait for jar and apt warm
         wait: jar
+
+      # Persist the freshly built jar under the key the driver jobs restore from. Splitting the
+      # lookup (above) from this save is what let the lookup skip downloading the 362MB jar -- a plain
+      # actions/cache would have downloaded it on restore just to no-op the save. Only on a miss: on a
+      # hit it is already cached. After the wait, so the background build has finished writing it.
+      - name: Save Iceberg writer jar cache
+        if: steps.jar-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
+          key: ${{ runner.os }}-iceberg-jar-${{ hashFiles('destination/iceberg/olake-iceberg-java-writer/pom.xml', 'destination/iceberg/olake-iceberg-java-writer/src/**') }}
 
   # Self-contained -- ONE job per driver via the matrix. On the ephemeral runner
   # pool each job is a fresh VM with its own Docker daemon, so nothing is shared

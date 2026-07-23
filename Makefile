@@ -326,13 +326,19 @@ $(foreach d,$(DRIVERS),$(eval $(call DEV_BUILD_template,$(d))))
 # database stack plus an olake container per sync. CI overrides it (TEST_JOBS=5).
 TEST_JOBS ?=
 
-# Everything one driver's suites need, brought up CONCURRENTLY: its source stack, the shared
-# destination stack and the writer JAR. A recursive -j sub-make rather than plain prerequisites,
-# because prerequisites of a single target only run in parallel when the CALLER passes -j, and
-# `make test.driver.<d>` has to overlap the two compose pulls on its own. Every goal is
-# idempotent (compose up -d, a readiness poll, an up-to-date JAR), so running a second suite in
-# the same checkout just re-probes and returns.
-driver_test_setup = $(MAKE) --no-print-directory -j3 db.$(1).start db.destination.all.start $(ICEBERG_JAR)
+# Everything one driver's suites need, brought up CONCURRENTLY: its source stack and the shared
+# destination stack (plus the writer JAR, but only when we build the image ourselves -- see below).
+# A recursive -j sub-make rather than plain prerequisites, because prerequisites of a single target
+# only run in parallel when the CALLER passes -j, and `make test.driver.<d>` has to overlap the two
+# compose pulls on its own. Every goal is idempotent (compose up -d, a readiness poll), so running a
+# second suite in the same checkout just re-probes and returns.
+#
+# The JAR is ONLY an input to the driver IMAGE build (the Dockerfile COPYs it). When OLAKE_DRIVER_IMAGE
+# pins a pre-built image -- CI, which built it in an earlier step -- the harness skips the image build,
+# so the JAR is not needed here; and requiring it would make this file target rebuild whenever the
+# restored JAR's mtime trails the freshly checked-out sources, a needless (dockerized-Maven) run. So
+# it is a prerequisite only when we would actually build the image.
+driver_test_setup = $(MAKE) --no-print-directory -j3 db.$(1).start db.destination.all.start $(if $(OLAKE_DRIVER_IMAGE),,$(ICEBERG_JAR))
 
 # Compile the driver's test binary without running it, so the (cold) build is paid while CI's
 # detached container pull and image build are still in flight instead of inside the test step.
