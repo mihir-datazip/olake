@@ -367,7 +367,8 @@ func deleteKafkaTopic(ctx context.Context, t *testing.T, client *kgo.Client, top
 		err = res[topic].Err
 	}
 	require.NoError(t, err, "failed to delete topic '%s'", topic)
-	time.Sleep(5 * time.Second)
+
+	ensureTopicDeletion(ctx, t, client, topic)
 }
 
 // createTopic creates the test topic with a fixed partition count and replication factor 1.
@@ -526,6 +527,40 @@ func encodeAndWriteAvro(ctx context.Context, t *testing.T, writer *kgo.Client, c
 
 	// write message
 	writeMessagesWithRetry(ctx, t, writer, &kgo.Record{Key: key, Value: msg})
+}
+
+func ensureTopicDeletion(ctx context.Context, t *testing.T, client *kgo.Client, topic string) {
+	t.Helper()
+
+	topicAdminTimeout := 30 * time.Second
+	topicPollInterval := 200 * time.Millisecond
+
+	// waitCtx bounds the whole wait — every probe RPC and every pause runs under it, so
+	// the loop cannot outlive topicAdminTimeout no matter where it blocks.
+	waitCtx, cancel := context.WithTimeout(ctx, topicAdminTimeout)
+	defer cancel()
+	adm := kadm.NewClient(client)
+	start := time.Now()
+	for {
+		vres, verr := adm.ValidateCreateTopics(waitCtx, int32(partitionCount), 1, nil, topic)
+		if verr == nil {
+			if vres[topic].Err == nil {
+				t.Logf("topic %q deletion completed after %s", topic, time.Since(start).Round(time.Millisecond))
+				return
+			}
+			require.ErrorIs(t, vres[topic].Err, kerr.TopicAlreadyExists,
+				"unexpected validation error while waiting for topic '%s' deletion", topic)
+		}
+		if waitCtx.Err() != nil {
+			t.Fatalf("topic %q deletion did not complete within %s (last error: %v)", topic, topicAdminTimeout, verr)
+		}
+		require.NoError(t, verr, "failed to validate-create while waiting for topic '%s' deletion", topic)
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("topic %q deletion did not complete within %s", topic, topicAdminTimeout)
+		case <-time.After(topicPollInterval):
+		}
+	}
 }
 
 // JSON data format resources

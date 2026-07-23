@@ -312,6 +312,11 @@ endef
 $(foreach d,$(DRIVERS),$(eval $(call DEV_BUILD_template,$(d))))
 
 # --- tests --------------------------------------------------------------------
+# Driver suites run concurrently in the aggregate targets below. The default is one job per
+# driver in that run; what actually bounds it is the runner, since every suite drives its own
+# database stack plus an olake container per sync. CI overrides it (TEST_JOBS=5).
+TEST_JOBS ?=
+
 define INTEGRATION_TEST_template
 .PHONY: test.integration.$(1)
 test.integration.$(1): prepare.$(1) db.$(1).start db.destination.all.start $$(ICEBERG_JAR)
@@ -327,10 +332,10 @@ endef
 $(foreach d,$(CDC_DRIVERS),$(eval $(call TWO_PC_TEST_template,$(d))))
 
 test.integration: $(addprefix prepare.,$(SOURCE_DRIVERS)) db.all.start $(ICEBERG_JAR)
-	$(foreach d,$(SOURCE_DRIVERS),$(GO_ENV.$(d))) cd tests && go test -v -p $(words $(SOURCE_DRIVERS)) $(INTEGRATION_PKGS) -timeout 0 -count=1 -run 'Integration'
+	$(foreach d,$(SOURCE_DRIVERS),$(GO_ENV.$(d))) cd tests && go test -v -p $(or $(TEST_JOBS),$(words $(SOURCE_DRIVERS))) $(INTEGRATION_PKGS) -timeout 0 -count=1 -run 'Integration'
 
 test.2pc: $(addprefix prepare.,$(CDC_DRIVERS)) $(addprefix db.,$(addsuffix .start,$(CDC_DRIVERS))) db.destination.all.start $(ICEBERG_JAR)
-	$(foreach d,$(CDC_DRIVERS),$(GO_ENV.$(d))) cd tests && go test -v -p $(words $(CDC_DRIVERS)) $(CDC_PKGS) -timeout 0 -count=1 -run '2PC'
+	$(foreach d,$(CDC_DRIVERS),$(GO_ENV.$(d))) cd tests && go test -v -p $(or $(TEST_JOBS),$(words $(CDC_DRIVERS))) $(CDC_PKGS) -timeout 0 -count=1 -run '2PC'
 
 # Unit tests across every module in the go.work workspace. Directory patterns
 # ({{.Dir}}/...), not module-path patterns: in a go.work workspace a path pattern
@@ -386,7 +391,7 @@ help:
 		$(call print_help_targets) \
 	fi
 	@echo ""
-	@echo "Overridables: SOURCE_DRIVERS COMPOSE WAIT_RETRIES WAIT_SLEEP IMAGE_TAG"
+	@echo "Overridables: SOURCE_DRIVERS COMPOSE WAIT_RETRIES WAIT_SLEEP IMAGE_TAG TEST_JOBS"
 
 .PHONY: lint build \
 	db.source.all.start db.source.all.stop db.source.all.teardown db.source.all.restart db.source.all.refresh \

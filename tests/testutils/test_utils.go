@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,8 +27,12 @@ import (
 )
 
 const (
-	icebergCatalog                 = "olake_iceberg"
-	sparkConnectAddress            = "sc://localhost:15002"
+	icebergCatalog = "olake_iceberg"
+	// IP literal, not "localhost": hostname targets make grpc-go's DNS resolver issue
+	// service-config TXT lookups that /etc/hosts cannot answer, stalling every new
+	// connection ~20s when the DNS servers are slow to answer them (e.g. VPN resolvers).
+	// IP literals skip the DNS resolver entirely (measured: first query 20.22s vs 42ms).
+	sparkConnectAddress            = "sc://127.0.0.1:15002"
 	SyncTimeout                    = 10 * time.Minute
 	BenchmarkThreshold             = 0.9
 	maxRPSHistorySize              = 5
@@ -349,7 +354,7 @@ func updateStreamConfig(config *TestConfig, namespace, streamName, syncMode, cur
 // resetStateFile clears state.json so incremental can perform its initial load
 // (equivalent to a full load on first run), irrespective of any previous CDC run.
 func resetStateFile(config *TestConfig) error {
-	return writeHostFile(config.HostStatePath, []byte("{}"), 0644)
+	return writeHostFile(config.HostStatePath, fmt.Appendf(nil, `{"version": %d}`, constants.LatestStateVersion), 0644)
 }
 
 func copyFile(src, dst string) error {
@@ -1378,20 +1383,46 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 	})
 }
 
+var (
+	sharedSparkOnce sync.Once
+	sharedSpark     sql.SparkSession
+	sharedSparkErr  error
+)
+
+// sparkSession returns the shared Spark Connect session, building it on first use. Transient
+// connection failures are retried, and the session is warmed with a trivial query so the
+// one-off server-side bootstrap shows up in the timing log here rather than inflating
+// whichever verify happens to run first.
+func sparkSession(ctx context.Context, t *testing.T) (sql.SparkSession, error) {
+	sharedSparkOnce.Do(func() {
+		defer trackPhaseTiming(t, "spark", "session build")()
+		for attempt := 1; ; attempt++ {
+			sharedSpark, sharedSparkErr = sql.NewSessionBuilder().Remote(sparkConnectAddress).Build(ctx)
+			if sharedSparkErr == nil || attempt == 3 {
+				break
+			}
+			t.Logf("Attempt %d/3: Failed to connect to Spark, retrying in 2s: %v", attempt, sharedSparkErr)
+			time.Sleep(2 * time.Second)
+		}
+		if sharedSparkErr != nil {
+			return
+		}
+		if _, err := sharedSpark.Sql(ctx, "SELECT 1"); err != nil {
+			t.Logf("Spark session warm-up query failed (non-fatal): %v", err)
+		}
+	})
+	return sharedSpark, sharedSparkErr
+}
+
 // dropIcebergTable drops an Iceberg table using Spark SQL
 func dropIcebergTable(t *testing.T, tableName, icebergDB string) {
 	t.Helper()
 	ctx := context.Background()
-	spark, err := sql.NewSessionBuilder().Remote(sparkConnectAddress).Build(ctx)
+	spark, err := sparkSession(ctx, t)
 	if err != nil {
 		t.Logf("Failed to connect to Spark Connect server for dropping table: %v", err)
 		return
 	}
-	defer func() {
-		if stopErr := spark.Stop(); stopErr != nil {
-			t.Logf("Failed to stop Spark session: %v", stopErr)
-		}
-	}()
 
 	fullTableName := fmt.Sprintf("%s.%s.%s", icebergCatalog, icebergDB, tableName)
 	dropQuery := fmt.Sprintf("DROP TABLE IF EXISTS %s", fullTableName)
@@ -1410,15 +1441,16 @@ func dropIcebergTable(t *testing.T, tableName, icebergDB string) {
 func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema map[string]string, defaultCDCColumnsSchema map[string]string, schema map[string]interface{}, opSymbol, partitionRegex, driver string, isCDC bool, excludedColumn string) {
 	t.Helper()
 	ctx := context.Background()
-	spark, err := sql.NewSessionBuilder().Remote(sparkConnectAddress).Build(ctx)
+	spark, err := sparkSession(ctx, t)
 	require.NoError(t, err, "Failed to connect to Spark Connect server")
-	defer func() {
-		if stopErr := spark.Stop(); stopErr != nil {
-			t.Errorf("Failed to stop Spark session: %v", stopErr)
-		}
-	}()
 
 	fullTableName := fmt.Sprintf("%s.%s.%s", icebergCatalog, icebergDB, tableName)
+	// The shared session's Iceberg catalog caches table snapshots, so refresh before reading
+	// to see the rows the sync just committed (non-fatal: the table may not exist yet on the
+	// first sync — the retry loop below handles that).
+	if _, refreshErr := spark.Sql(ctx, fmt.Sprintf("REFRESH TABLE %s", fullTableName)); refreshErr != nil {
+		t.Logf("REFRESH TABLE before verify (non-fatal): %v", refreshErr)
+	}
 	selectQuery := fmt.Sprintf(
 		"SELECT * FROM %s WHERE _op_type = '%s'",
 		fullTableName, opSymbol,
@@ -1595,13 +1627,8 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 func VerifyIcebergNoDuplicates(ctx context.Context, t *testing.T, tableName, icebergDB, opSymbol string, expectedRowCountByOpType int64) {
 	t.Helper()
 
-	spark, err := sql.NewSessionBuilder().Remote(sparkConnectAddress).Build(ctx)
+	spark, err := sparkSession(ctx, t)
 	require.NoError(t, err, "Failed to connect to Spark Connect server for duplicate check")
-	defer func() {
-		if stopErr := spark.Stop(); stopErr != nil {
-			t.Errorf("Failed to stop Spark session: %v", stopErr)
-		}
-	}()
 
 	fullTableName := fmt.Sprintf("%s.%s.%s", icebergCatalog, icebergDB, tableName)
 
@@ -1655,25 +1682,8 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 	t.Helper()
 	ctx := context.Background()
 
-	// Retry Spark session creation for transient connection issues
-	var spark sql.SparkSession
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		spark, err = sql.NewSessionBuilder().Remote(sparkConnectAddress).Build(ctx)
-		if err == nil {
-			break
-		}
-		if attempt < 3 {
-			t.Logf("Attempt %d/3: Failed to connect to Spark, retrying in 2s: %v", attempt, err)
-			time.Sleep(2 * time.Second)
-		}
-	}
+	spark, err := sparkSession(ctx, t)
 	require.NoError(t, err, "Failed to connect to Spark Connect server")
-	defer func() {
-		if stopErr := spark.Stop(); stopErr != nil {
-			t.Errorf("Failed to stop Spark session: %v", stopErr)
-		}
-	}()
 
 	parquetPath := fmt.Sprintf("s3a://warehouse/%s/%s", parquetDB, tableName)
 	viewName := fmt.Sprintf("`%s_view_%d`", tableName, time.Now().UnixNano())
@@ -1871,7 +1881,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 	// runPerfOlake runs the driver image with host networking so the perf run reaches the
 	// external benchmark databases directly, exactly as a deployed sync would.
 	runPerfOlake := func(olakeArgs ...string) (int, []byte, error) {
-		ensureDriverImage(t, cfg.TestConfig)
+		getOrBuildDriverImage(t, cfg.TestConfig)
 		args := dockerRunArgs(cfg.TestConfig, []string{"--network", "host"}, olakeArgs)
 		out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 		return dockerExitResult(out, err, olakeArgs[0])

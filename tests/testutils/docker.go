@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 
@@ -16,6 +17,10 @@ const (
 	// driver container; all olake inputs and outputs (streams.json, state.json, stats.json,
 	// logs) live under it since the CLI writes next to --config.
 	containerTestDataDir = "/testdata"
+
+	// skipDestinationCheckEnvVar mirrors destination.SkipDestinationCheckEnvVar. Declared here
+	// rather than imported so this module keeps no dependency on the root one.
+	skipDestinationCheckEnvVar = "OLAKE_SKIP_DESTINATION_CHECK"
 )
 
 // driverImageRef returns the image the harness runs, `olake/source-<driver>:local` as
@@ -32,18 +37,16 @@ var (
 	ensureImageErr  error
 )
 
-// ensureDriverImage makes sure the driver image exists locally, building it via
-// `make docker.<driver>.build` when missing. CI pre-builds the image; this fallback keeps
-// local runs one-command. Guarded by sync.Once so parallel tests trigger the (slow) build
-// at most once and all share its result.
-func ensureDriverImage(t *testing.T, cfg *TestConfig) string {
+// getOrBuildDriverImage makes sure the driver image is up to date, (re)building it via
+// `make docker.<driver>.build` unconditionally so a local run always exercises the current
+// code -- docker's layer cache makes that near-free when nothing changed. CI pre-builds the
+// image; this fallback keeps local runs one-command. Guarded by sync.Once so parallel tests
+// trigger the (slow) build at most once and all share its result.
+func getOrBuildDriverImage(t *testing.T, cfg *TestConfig) string {
 	t.Helper()
 	ref := driverImageRef(cfg.Driver)
 	ensureImageOnce.Do(func() {
-		if err := exec.Command("docker", "image", "inspect", ref).Run(); err == nil {
-			return
-		}
-		t.Logf("driver image %s not found locally, building it with `make docker.%s.build`", ref, cfg.Driver)
+		t.Logf("building driver image %s with `make docker.%s.build` to pick up the latest local changes", ref, cfg.Driver)
 		// wall-clock via trackPhaseTiming, not cmd.ProcessState.SystemTime() (that reports make's
 		// kernel CPU time — a misleading ~87ms even when the docker build actually took far longer).
 		defer trackPhaseTiming(t, "driver-image", ref)()
@@ -69,7 +72,13 @@ func dockerRunArgs(cfg *TestConfig, extraFlags []string, olakeArgs []string) []s
 		"run", "--rm",
 		"-v", fmt.Sprintf("%s:%s", cfg.HostTestDataPath, containerTestDataDir),
 		"-e", "TELEMETRY_DISABLED=true",
+		"-e", "OLAKE_TIMING=1",
 	}
+
+	if v := os.Getenv(skipDestinationCheckEnvVar); v != "" {
+		args = append(args, "-e", skipDestinationCheckEnvVar+"="+v)
+	}
+
 	if cfg.ImagePlatform != "" {
 		args = append(args, "--platform", cfg.ImagePlatform)
 	}
@@ -88,12 +97,26 @@ func dockerRunArgs(cfg *TestConfig, extraFlags []string, olakeArgs []string) []s
 // experience at the CLI.
 func runOlake(ctx context.Context, t *testing.T, cfg *TestConfig, olakeArgs ...string) (int, []byte, error) {
 	t.Helper()
-	ensureDriverImage(t, cfg)
+	getOrBuildDriverImage(t, cfg)
 	defer trackPhaseTiming(t, cfg.Driver, olakeArgs[0]+" run")()
 
 	args := dockerRunArgs(cfg, []string{"--add-host", "host.docker.internal:host-gateway"}, olakeArgs)
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	logContainerTimings(t, out)
 	return dockerExitResult(out, err, olakeArgs[0])
+}
+
+// logContainerTimings re-emits the `[timing]` lines the driver wrote inside the container. A
+// successful `docker run`'s output is otherwise dropped on the floor, so without this the
+// in-container breakdown is invisible and every sync reads as one opaque span. The leading
+// log prefix is trimmed so the forwarded lines line up with the harness's own.
+func logContainerTimings(t *testing.T, out []byte) {
+	t.Helper()
+	for _, line := range strings.Split(string(out), "\n") {
+		if idx := strings.Index(line, "[timing]"); idx >= 0 {
+			t.Logf("  container %s", strings.TrimSpace(line[idx:]))
+		}
+	}
 }
 
 // dockerExitResult normalizes `docker run`'s outcome into (exitCode, output, err): a non-zero

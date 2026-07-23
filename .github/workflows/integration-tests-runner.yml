@@ -81,25 +81,60 @@ jobs:
       # the driver images the tests build lazily.
       - name: Bootstrap Iceberg Catalog
         run: |
+          build_and_check() {
+            local driver=$1
+            local testdata="tests/$driver/testdata"
+            local config
+
+            config=$(cd "$testdata" && find . -name iceberg_destination.json | sort | head -1)
+            config=${config#./}
+            [ -n "$config" ] || { echo "no iceberg_destination.json under $testdata" >&2; return 1; }
+
+            make docker."$driver".build
+            docker run --rm \
+              --add-host host.docker.internal:host-gateway \
+              -v "$PWD/$testdata:/testdata" \
+              -e TELEMETRY_DISABLED=true \
+              "olake/source-${driver}:local" check --destination "/testdata/$config"
+          }
+
           set -- $(make -s print.source-drivers)
-          driver=$1
-          make docker.$driver.build
-          docker run --rm \
-            --add-host host.docker.internal:host-gateway \
-            -v "$PWD/tests/$driver/testdata:/testdata" \
-            -e TELEMETRY_DISABLED=true \
-            "olake/source-$driver:local" \
-            check --destination /testdata/iceberg_destination.json
+          first=$1
+          shift
+
+          echo "::group::$first (bootstrap, serial)"
+          build_and_check "$first"
+          echo "::endgroup::"
+
+          started=""
+          for driver in "$@"; do
+            build_and_check "$driver" > "/tmp/bootstrap-$driver.log" 2>&1 &
+            started="$started $driver:$!"
+          done
+
+          rc=0
+          for entry in $started; do
+            name=${entry%%:*}
+            if wait "${entry##*:}"; then status=ok; else status=FAILED; rc=1; fi
+            echo "::group::$name ($status)"
+            cat "/tmp/bootstrap-$name.log"
+            echo "::endgroup::"
+          done
+          exit $rc
 
       # test.integration / test.2pc run every driver's suite in parallel from the
-      # tests workspace (-p <driver count>), with the per-driver cgo env applied.
+      # tests workspace
       - name: Run Integration Tests
         if: inputs.test_type == 'integration'
-        run: make test.integration
+        env:
+          OLAKE_SKIP_DESTINATION_CHECK: "true"
+        run: make test.integration TEST_JOBS=5
 
       - name: Run 2PC Integration Tests
         if: inputs.test_type == '2pc'
-        run: make test.2pc
+        env:
+          OLAKE_SKIP_DESTINATION_CHECK: "true"
+        run: make test.2pc TEST_JOBS=5
 
       # stop, not teardown: teardown also deletes the root-owned data dir above.
       - name: Cleanup
