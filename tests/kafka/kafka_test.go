@@ -71,7 +71,6 @@ func kafkaAvroBaseConfig() *testutils.IntegrationTest {
 
 func TestKafkaIntegration(t *testing.T) {
 	t.Parallel()
-
 	tests := []struct {
 		name string
 		cfg  *testutils.IntegrationTest
@@ -99,5 +98,6 @@ func TestKafka2PC(t *testing.T) {
 }
 
 func TestKafkaRebalance(t *testing.T) {
+	t.Parallel()
 	kafkaJsonBaseConfig().TestRebalance(t)
 }

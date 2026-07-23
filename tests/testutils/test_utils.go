@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path"
@@ -69,6 +70,11 @@ type SyncSpeed struct {
 type TestConfig struct {
 	Driver     string
 	DataFormat string
+	// Suite isolates one driver's suites from each other so they can run concurrently. Empty for
+	// the integration suite, which has to keep the unsuffixed names because `discover` writes
+	// streams.json next to --config and that path is not ours to choose; the other suites seed
+	// their own catalog and so can take suffixed ones. See applySuite.
+	Suite string
 	// ImagePlatform overrides the platform the driver image runs under (e.g. "linux/amd64"
 	// for drivers whose image only exists for amd64, run emulated on other hosts).
 	ImagePlatform string
@@ -81,6 +87,7 @@ type TestConfig struct {
 	HostStatePath           string
 	HostStateCheckpointPath string // backup of state.json used in 2PC recovery tests
 	HostIcebergDestPath     string
+	HostSourcePath          string // source.json; applySuite derives per-suite copies from it
 	HostStatsPath           string
 	BenchmarksPath          string
 
@@ -91,6 +98,254 @@ type TestConfig struct {
 	ParquetDestinationPath string
 	StatePath              string
 	StatsPath              string
+}
+
+// applySuite scopes every file a suite REWRITES to that suite, so two suites for the same driver
+// can run at once. Read-only fixtures (source.json, test_streams.json, the destination configs)
+// stay shared -- only the outputs move. Host and container names are suffixed identically, since
+// the whole testdata dir is bind-mounted at /testdata and the CLI is handed both sides.
+//
+// A no-op for the integration suite (empty name): `discover` writes streams.json next to --config
+// with no flag to redirect it, so that one suite is pinned to the unsuffixed names.
+func applySuite(t *testing.T, c *TestConfig, suite string) {
+	t.Helper()
+	if suite == "" {
+		return
+	}
+	c.Suite = suite
+
+	// A DIRECTORY per suite, not a filename suffix. A sync run without --state writes its state to
+	// <folder of --config>/state.json (protocol/root.go), and the suite chain depends on that: the
+	// stateless Full-Refresh persists its post-backfill CDC position there, and the CDC syncs after
+	// it read it back. Rename the file and that handshake breaks silently -- the position lands in
+	// the shared state.json, the suite's own stays {}, and PreCDC treats the next sync as a first
+	// CDC run, advancing the slot past the very change the test just made. So the names stay put
+	// and the directory moves, which isolates the suite AND keeps olake's implicit default correct.
+	//
+	// Only the files a suite REWRITES move. The read-only fixtures (test_streams.json, the
+	// destination configs) stay at the testdata root and are passed by their own explicit flags.
+	hostSuiteDir := filepath.Join(c.HostTestDataPath, suite)
+	require.NoError(t, os.MkdirAll(hostSuiteDir, 0755), "failed to create the %q suite directory", suite)
+	hostPath := func(file string) string { return filepath.Join(hostSuiteDir, file) }
+	containerPath := func(file string) string { return path.Join(containerTestDataDir, suite, file) }
+
+	c.HostCatalogPath = hostPath("streams.json")
+	c.HostStatePath = hostPath("state.json")
+	c.HostStateCheckpointPath = hostPath("state_checkpoint.json")
+	c.HostStatsPath = hostPath("stats.json")
+
+	c.CatalogPath = containerPath("streams.json")
+	c.StatePath = containerPath("state.json")
+	c.StatsPath = containerPath("stats.json")
+
+	// --config has to live in the suite directory too -- it is what anchors the default state path
+	// above. Copied unconditionally for that reason; variantSourceOverride then edits the copy for
+	// drivers whose CDC readers would otherwise contend (postgres a private replication slot, kafka
+	// a private consumer group).
+	edit := variantSourceOverride(c.Driver, testTableName(c))
+	if edit == nil {
+		edit = func(map[string]interface{}) error { return nil }
+	}
+	require.NoError(t, copyJSONWithEdit(c.HostSourcePath, hostPath("source.json"), edit),
+		"failed to derive the source config for suite %q", suite)
+	c.HostSourcePath = hostPath("source.json")
+	c.SourcePath = containerPath("source.json")
+}
+
+// copyJSONWithEdit reads the JSON at srcHost, applies edit, and writes the result to dstHost --
+// used to derive a per-suite config from a shared base file without touching the base.
+func copyJSONWithEdit(srcHost, dstHost string, edit func(map[string]interface{}) error) error {
+	raw, err := os.ReadFile(srcHost)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %s", srcHost, err)
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("failed to parse %s: %s", srcHost, err)
+	}
+	if err := edit(doc); err != nil {
+		return err
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal %s: %s", dstHost, err)
+	}
+	return writeHostFile(dstHost, out, 0644)
+}
+
+// variantSourceOverride returns the per-suite source edit for drivers whose concurrent CDC readers
+// would otherwise contend: postgres (a logical replication slot allows one consumer, so each suite
+// needs its own) and kafka (suites sharing one consumer group split the topic's partitions, so each
+// loses records -- give each its own group). id is the suite's unique key, its test table.
+//
+// Returns nil for drivers that can share source.json: mysql assigns its own server_id, and
+// mongodb/mssql change streams are natively multi-reader.
+func variantSourceOverride(driver, id string) func(map[string]interface{}) error {
+	switch driver {
+	case string(constants.Postgres):
+		return func(doc map[string]interface{}) error {
+			updateMethod, ok := doc["update_method"].(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("no update_method object in source config")
+			}
+			updateMethod["replication_slot"] = id
+			return nil
+		}
+	case string(constants.Kafka):
+		return func(doc map[string]interface{}) error {
+			doc["consumer_group_id"] = id
+			return nil
+		}
+	}
+	return nil
+}
+
+// testTableName is the source table a suite drives. The suite suffix is what keeps concurrent
+// suites off each other's table -- without it they race the same DROP/CREATE.
+func testTableName(c *TestConfig) string {
+	name := utils.Ternary(c.DataFormat == "",
+		fmt.Sprintf("%s_test_table_olake", c.Driver),
+		fmt.Sprintf("%s_%s_test_table_olake", c.Driver, c.DataFormat)).(string)
+	return utils.Ternary(c.Suite == "", name, fmt.Sprintf("%s_%s", name, c.Suite)).(string)
+}
+
+// destinationDBPrefix is passed as --destination-database-prefix. It carries the suite too because
+// Iceberg.Check probes <prefix>_test_olake on every sync, so suites sharing a prefix would race
+// that probe's CREATE TABLE.
+func destinationDBPrefix(c *TestConfig) string {
+	prefix := utils.Ternary(c.DataFormat == "",
+		fmt.Sprintf("integration_%s", c.Driver),
+		fmt.Sprintf("integration_%s_%s", c.Driver, c.DataFormat)).(string)
+	return utils.Ternary(c.Suite == "", prefix, fmt.Sprintf("%s_%s", prefix, c.Suite)).(string)
+}
+
+// verifyDiscoveredStreams asserts that every stream test_streams.json describes was discovered,
+// and that what discover produced for it matches. Streams BEYOND those are ignored on purpose:
+// discover enumerates the whole database, so whatever else lives there -- another suite's table,
+// leftovers from an aborted run -- says nothing about whether this driver discovered its own
+// table correctly. Comparing the documents whole made the assertion depend on what else happened
+// to exist at that moment, which is not what it is trying to prove.
+func verifyDiscoveredStreams(t *testing.T, expectedPath, actualPath string) {
+	t.Helper()
+
+	load := func(path, what string) map[string]interface{} {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err, "failed to read %s streams JSON (%s)", what, path)
+		var doc map[string]interface{}
+		require.NoError(t, json.Unmarshal(data, &doc), "failed to parse %s streams JSON (%s)", what, path)
+		return doc
+	}
+	expected := load(expectedPath, "expected")
+	actual := load(actualPath, "discovered")
+
+	// streams[]: keyed by namespace.name, which is what makes a stream unique in a catalog.
+	indexStreams := func(doc map[string]interface{}) map[string]interface{} {
+		out := map[string]interface{}{}
+		entries, _ := doc["streams"].([]interface{})
+		for _, raw := range entries {
+			wrapper, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			stream, ok := wrapper["stream"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			out[fmt.Sprintf("%v.%v", stream["namespace"], stream["name"])] = wrapper
+		}
+		return out
+	}
+	// selected_streams: a map of namespace -> []{stream_name, ...}; key the same way.
+	indexSelected := func(doc map[string]interface{}) map[string]interface{} {
+		out := map[string]interface{}{}
+		byNamespace, _ := doc["selected_streams"].(map[string]interface{})
+		for namespace, raw := range byNamespace {
+			entries, _ := raw.([]interface{})
+			for _, entry := range entries {
+				selected, ok := entry.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				out[fmt.Sprintf("%v.%v", namespace, selected["stream_name"])] = selected
+			}
+		}
+		return out
+	}
+
+	compare := func(section string, want, got map[string]interface{}) {
+		for key, wantEntry := range want {
+			gotEntry, found := got[key]
+			require.Truef(t, found, "%s: discover did not return %q (found: %v)", section, key, slices.Sorted(maps.Keys(got)))
+			wantJSON, err := json.Marshal(wantEntry)
+			require.NoError(t, err)
+			gotJSON, err := json.Marshal(gotEntry)
+			require.NoError(t, err)
+			require.Truef(t, utils.NormalizedEqual(string(wantJSON), string(gotJSON)),
+				"%s: discovered %q does not match test_streams.json\nExpected:\n%s\nGot:\n%s", section, key, wantJSON, gotJSON)
+		}
+	}
+	compare("streams", indexStreams(expected), indexStreams(actual))
+	compare("selected_streams", indexSelected(expected), indexSelected(actual))
+
+	t.Logf("Generated streams validated with test streams")
+}
+
+// seedCatalogFromTestStreams writes test_streams.json out as the suite's catalog, renaming the
+// stream to this suite's table. The fixture names the unsuffixed table, so without the rename a
+// suffixed suite would sync a stream that does not exist.
+//
+// Field-by-field rather than a text substitution, because the two identifiers do not share a
+// spelling: stream names follow the SOURCE's casing (oracle and db2 are SkipCDCDrivers, so
+// normalizeStreamName folds theirs to upper) while destination_table is the Iceberg table and stays
+// lowercase. A single replace catches only one of them -- which left the 2PC suite reading its own
+// _2pc source table but writing into the integration suite's Iceberg table, so one sync hit
+// "Table already exists" and the other's verify found nothing. Two replaces would be worse: for
+// drivers where the spellings DO match it would rename twice, yielding <table>_2pc_2pc.
+func seedCatalogFromTestStreams(t *testing.T, c *TestConfig, testTable string) {
+	t.Helper()
+	if c.Suite == "" {
+		data, err := os.ReadFile(c.HostTestCatalogPath)
+		require.NoError(t, err, "failed to read test_streams.json")
+		require.NoError(t, writeHostFile(c.HostCatalogPath, data, 0600), "failed to write %s", c.HostCatalogPath)
+		return
+	}
+
+	base := strings.TrimSuffix(testTable, "_"+c.Suite)
+	fromStream, toStream := normalizeStreamName(c.Driver, base), normalizeStreamName(c.Driver, testTable)
+
+	require.NoError(t, copyJSONWithEdit(c.HostTestCatalogPath, c.HostCatalogPath, func(doc map[string]interface{}) error {
+		entries, _ := doc["streams"].([]interface{})
+		for _, raw := range entries {
+			wrapper, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			stream, ok := wrapper["stream"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if stream["name"] == fromStream {
+				stream["name"] = toStream
+			}
+			if stream["destination_table"] == base {
+				stream["destination_table"] = testTable
+			}
+		}
+		byNamespace, _ := doc["selected_streams"].(map[string]interface{})
+		for _, raw := range byNamespace {
+			selected, _ := raw.([]interface{})
+			for _, entry := range selected {
+				stream, ok := entry.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if stream["stream_name"] == fromStream {
+					stream["stream_name"] = toStream
+				}
+			}
+		}
+		return nil
+	}), "failed to seed the %q catalog", c.Suite)
 }
 
 // WithImagePlatform is used to override the platform for the test container image.
@@ -221,6 +476,7 @@ func GetTestConfig(driver string, extraParams ...string) *TestConfig {
 		HostStatePath:           hostPath("state.json"),
 		HostStateCheckpointPath: hostPath("state_checkpoint.json"),
 		HostIcebergDestPath:     hostPath("iceberg_destination.json"),
+		HostSourcePath:          hostPath("source.json"),
 		HostStatsPath:           hostPath("stats.json"),
 		BenchmarksPath:          hostPath("benchmarks.json"),
 		SourcePath:              containerPath("source.json"),
@@ -478,7 +734,7 @@ func (cfg *IntegrationTest) runSyncAndVerify(
 	schema map[string]interface{},
 	isCDC bool,
 ) error {
-	destDBPrefix := utils.Ternary(cfg.TestConfig.DataFormat != "", fmt.Sprintf("integration_%s_%s", cfg.TestConfig.Driver, cfg.TestConfig.DataFormat), fmt.Sprintf("integration_%s", cfg.TestConfig.Driver)).(string)
+	destDBPrefix := destinationDBPrefix(cfg.TestConfig)
 	cmd := syncArgs(*cfg.TestConfig, useState, destinationType, "--destination-database-prefix", destDBPrefix)
 
 	// Execute operation before sync if needed
@@ -1119,17 +1375,29 @@ func (cfg *IntegrationTest) testIceberg2PCIncrementalRecovery(
 // independently of the happy-path integration tests, allowing them to be scheduled and
 // reported separately.
 func (cfg *IntegrationTest) Test2PCIntegration(t *testing.T) {
+	applySuite(t, cfg.TestConfig, "2pc")
 	ctx := context.Background()
 	cfg.ExecuteQuery = timedExecuteQuery(cfg.TestConfig.Driver, cfg.ExecuteQuery)
 
 	t.Logf("Root Project directory: %s", cfg.TestConfig.HostRootPath)
 	t.Logf("Test data directory: %s", cfg.TestConfig.HostTestDataPath)
-	currentTestTable := utils.Ternary(cfg.TestConfig.DataFormat == "", fmt.Sprintf("%s_test_table_olake", cfg.TestConfig.Driver), fmt.Sprintf("%s_%s_test_table_olake", cfg.TestConfig.Driver, cfg.TestConfig.DataFormat)).(string)
+	currentTestTable := testTableName(cfg.TestConfig)
+
+	// The slot lives as long as the source config that names it. applySuite pointed this suite's
+	// source config at slot = its table, and olake validates the CDC configuration at startup for
+	// EVERY sync in the suite -- including the incremental ones, whose streams never read it. So it
+	// is created once here and dropped when the suite ends; scoping it to the CDC tests alone left
+	// the incremental tests failing on "no record found" for a slot their config still referenced.
+	//
+	// Only postgres needs this: mysql assigns its own server_id, mongodb/mssql change streams are
+	// natively multi-reader, and kafka gets its own consumer group from the same source override.
+	if cfg.TestConfig.Driver == string(constants.Postgres) {
+		cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "create-slot", false)
+		defer cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "drop-slot", false)
+	}
 
 	// 2PC tests don't need schema discovery — the schema is already validated by the regular integration test.
-	testStreamsData, err := os.ReadFile(cfg.TestConfig.HostTestCatalogPath)
-	require.NoError(t, err, "failed to read test_streams.json")
-	require.NoError(t, writeHostFile(cfg.TestConfig.HostCatalogPath, testStreamsData, 0600), "failed to write streams.json")
+	seedCatalogFromTestStreams(t, cfg.TestConfig, currentTestTable)
 
 	t.Run("Sync", func(t *testing.T) {
 		cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "drop", false)
@@ -1183,7 +1451,7 @@ func (cfg *IntegrationTest) runRebalanceSync(
 ) error {
 	t.Helper()
 
-	destDBPrefix := fmt.Sprintf("integration_%s_%s", cfg.TestConfig.Driver, cfg.TestConfig.DataFormat)
+	destDBPrefix := destinationDBPrefix(cfg.TestConfig)
 	cmd := syncArgs(*cfg.TestConfig, useState, "iceberg", "--destination-database-prefix", destDBPrefix)
 
 	code, out, err := runOlake(ctx, t, cfg.TestConfig, cmd...)
@@ -1246,15 +1514,14 @@ func (cfg *IntegrationTest) testKafkaRebalance(
 
 // TestRebalance runs the Kafka consumer-group rebalance recovery integration test in an isolated container.
 func (cfg *IntegrationTest) TestRebalance(t *testing.T) {
+	applySuite(t, cfg.TestConfig, "rebalance")
 	ctx := context.Background()
 
 	t.Logf("Root Project directory: %s", cfg.TestConfig.HostRootPath)
 	t.Logf("Test data directory: %s", cfg.TestConfig.HostTestDataPath)
-	currentTestTable := fmt.Sprintf("%s_%s_test_table_olake", cfg.TestConfig.Driver, cfg.TestConfig.DataFormat)
+	currentTestTable := testTableName(cfg.TestConfig)
 
-	testStreamsData, err := os.ReadFile(cfg.TestConfig.HostTestCatalogPath)
-	require.NoError(t, err, "failed to read test_streams.json")
-	require.NoError(t, writeHostFile(cfg.TestConfig.HostCatalogPath, testStreamsData, 0600), "failed to write streams.json")
+	seedCatalogFromTestStreams(t, cfg.TestConfig, currentTestTable)
 
 	t.Run("Sync", func(t *testing.T) {
 		// 1. Query on test table
@@ -1284,7 +1551,7 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 
 	t.Logf("Root Project directory: %s", cfg.TestConfig.HostRootPath)
 	t.Logf("Test data directory: %s", cfg.TestConfig.HostTestDataPath)
-	currentTestTable := utils.Ternary(cfg.TestConfig.DataFormat == "", fmt.Sprintf("%s_test_table_olake", cfg.TestConfig.Driver), fmt.Sprintf("%s_%s_test_table_olake", cfg.TestConfig.Driver, cfg.TestConfig.DataFormat)).(string)
+	currentTestTable := testTableName(cfg.TestConfig)
 
 	t.Run("Discover", func(t *testing.T) {
 		// 1. Query on test table; drop first so leftover state from a previous
@@ -1301,19 +1568,8 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 			t.Fatalf("discover failed (%d): %s\n%s", code, err, string(out))
 		}
 
-		// 3. Verify streams.json file
-		streamsJSON, err := os.ReadFile(cfg.TestConfig.HostTestCatalogPath)
-		if err != nil {
-			t.Fatalf("failed to read expected streams JSON: %s", err)
-		}
-		testStreamsJSON, err := os.ReadFile(cfg.TestConfig.HostCatalogPath)
-		if err != nil {
-			t.Fatalf("failed to read actual streams JSON: %s", err)
-		}
-		if !utils.NormalizedEqual(string(streamsJSON), string(testStreamsJSON)) {
-			t.Fatalf("streams.json does not match expected test_streams.json\nExpected:\n%s\nGot:\n%s", string(streamsJSON), string(testStreamsJSON))
-		}
-		t.Logf("Generated streams validated with test streams")
+		// 3. Verify streams.json describes the streams we expect
+		verifyDiscoveredStreams(t, cfg.TestConfig.HostTestCatalogPath, cfg.TestConfig.HostCatalogPath)
 
 		// 4. Clean up
 		cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "drop", false)

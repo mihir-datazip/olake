@@ -78,7 +78,10 @@ func ExecuteQuery(ctx context.Context, t *testing.T, streams []string, operation
 				col_point POINT,
 				col_polygon POLYGON,
 				col_circle CIRCLE,
-				CONSTRAINT unique_custom_key UNIQUE (col_bigserial),
+				-- Unnamed so Postgres derives a table-qualified index name
+				-- (<table>_col_bigserial_key); a fixed name like "unique_custom_key" is
+				-- schema-scoped and collides when concurrent suites create their tables at once.
+				UNIQUE (col_bigserial),
 				excludedColumn INT NULL
 			)`, integrationTestTable)
 
@@ -260,6 +263,18 @@ func ExecuteQuery(ctx context.Context, t *testing.T, streams []string, operation
 
 	case "evolve-schema":
 		query = fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN col_int TYPE BIGINT, ALTER COLUMN col_float4 TYPE FLOAT, ADD COLUMN includedColumn INTEGER`, integrationTestTable)
+
+	case "create-slot":
+		// streams[0] is the suite's replication slot. Drop a stale inactive slot left by a local
+		// rerun (fresh CI containers have none), then create it; falls through to the exec below.
+		_, _ = db.ExecContext(ctx, fmt.Sprintf(`SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '%s' AND NOT active`, streams[0]))
+		query = fmt.Sprintf(`SELECT pg_create_logical_replication_slot('%s', 'pgoutput')`, streams[0])
+
+	case "drop-slot":
+		// Best-effort cleanup: never fail the suite on slot teardown (the CI container is discarded
+		// anyway). Skips a still-active slot; the next run's create-slot drops it once inactive.
+		_, _ = db.ExecContext(ctx, fmt.Sprintf(`SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '%s' AND NOT active`, streams[0]))
+		return
 
 	default:
 		t.Fatalf("Unsupported operation: %s", operation)

@@ -25,9 +25,14 @@ print.platforms.%:
 # Drivers with an explicit entry in drivers/platforms.conf are pinned to it.
 # Concrete (non-pattern) targets so they are phony and shells can autocomplete them.
 IMAGE_TAG ?= local
+# DOCKER_BUILD lets CI add buildx and a shared layer cache without changing local behaviour: the
+# integration workflow sets it to a buildx build that --cache-from the GHA layer cache its warm
+# job populated from base.Dockerfile (whose runtime stage mirrors this image's), so the apt-get
+# layer is a cache hit. Locally it stays a plain `docker build`.
+DOCKER_BUILD ?= docker build
 .PHONY: $(addsuffix .build,$(addprefix docker.,$(DRIVERS)))
 $(addsuffix .build,$(addprefix docker.,$(DRIVERS))): docker.%.build:
-	docker build $(addprefix --platform ,$(call local_driver_platforms,$*)) \
+	$(DOCKER_BUILD) $(addprefix --platform ,$(call local_driver_platforms,$*)) \
 		--build-arg DRIVER_NAME=$* \
 		-t olake/source-$*:$(IMAGE_TAG) .
 
@@ -115,7 +120,7 @@ ICEBERG_JAR := $(ICEBERG_WRITER_DIR)/target/olake-iceberg-java-writer-0.0.1-SNAP
 ICEBERG_JAR_SRCS := $(ICEBERG_WRITER_DIR)/pom.xml $(shell find $(ICEBERG_WRITER_DIR)/src -type f 2>/dev/null)
 ROOT_JAR := olake-iceberg-java-writer.jar
 
-# --- readiness probes (mirroring .github/workflows/integration-tests-runner.yml)
+# --- readiness probes (polled by db.<d>.wait / db.destination.all.wait, incl. in CI)
 # Defaults only; per-driver probes and overrides live in drivers/<d>/driver.mk.
 WAIT_RETRIES := 30
 WAIT_SLEEP := 5
@@ -183,8 +188,8 @@ CDC_DRIVERS := $(filter-out $(NON_CDC_DRIVERS),$(SOURCE_DRIVERS))
 INTEGRATION_PKGS := $(addsuffix /...,$(addprefix ./,$(SOURCE_DRIVERS)))
 CDC_PKGS := $(addsuffix /...,$(addprefix ./,$(CDC_DRIVERS)))
 
-# The drivers the integration suites cover, queried by CI (integration-tests-runner.yml) so the
-# list lives in this file only. CI bootstraps the shared iceberg catalog with the first of them.
+# The drivers the integration suites cover, queried by CI (integration-tests.yml) so the list
+# lives in this file only: it is what the driver matrix fans out to on a push to master.
 .PHONY: print.source-drivers
 print.source-drivers:
 	@echo $(SOURCE_DRIVERS)
@@ -302,6 +307,10 @@ $(ICEBERG_JAR): $(ICEBERG_JAR_SRCS)
 	fi
 	cp $(ICEBERG_JAR) $(ROOT_JAR)
 
+# Phony alias so CI (and humans) can `make iceberg.jar` without knowing the file path.
+.PHONY: iceberg.jar
+iceberg.jar: $(ICEBERG_JAR)
+
 # --- dev builds (generated per driver, incl. s3) ------------------------------
 define DEV_BUILD_template
 .PHONY: dev.$(1).build
@@ -317,16 +326,49 @@ $(foreach d,$(DRIVERS),$(eval $(call DEV_BUILD_template,$(d))))
 # database stack plus an olake container per sync. CI overrides it (TEST_JOBS=5).
 TEST_JOBS ?=
 
+# Everything one driver's suites need, brought up CONCURRENTLY: its source stack, the shared
+# destination stack and the writer JAR. A recursive -j sub-make rather than plain prerequisites,
+# because prerequisites of a single target only run in parallel when the CALLER passes -j, and
+# `make test.driver.<d>` has to overlap the two compose pulls on its own. Every goal is
+# idempotent (compose up -d, a readiness poll, an up-to-date JAR), so running a second suite in
+# the same checkout just re-probes and returns.
+driver_test_setup = $(MAKE) --no-print-directory -j3 db.$(1).start db.destination.all.start $(ICEBERG_JAR)
+
+# Compile the driver's test binary without running it, so the (cold) build is paid while CI's
+# detached container pull and image build are still in flight instead of inside the test step.
+# Goes through make rather than a bare `go test -c` because db2's test binary links the CGO
+# go_ibm_db driver: it needs prepare.<d> for the clidriver and GO_ENV.<d> for the cgo flags.
+define TEST_BUILD_template
+.PHONY: test.build.$(1)
+test.build.$(1): prepare.$(1)
+	$$(GO_ENV.$(1)) cd tests && go test -c -o /dev/null ./$(1)/...
+endef
+$(foreach d,$(SOURCE_DRIVERS),$(eval $(call TEST_BUILD_template,$(d))))
+
+# test.driver.<d> is the whole CI surface for one driver -- Integration, 2PC and (kafka)
+# Rebalance in a single `go test`, which is exactly what the integration-tests matrix job runs.
+# Performance is excluded: it needs external infra and has its own workflow. The targets below
+# it stay as the focused local ones.
+define DRIVER_TEST_template
+.PHONY: test.driver.$(1)
+test.driver.$(1): prepare.$(1)
+	@$$(call driver_test_setup,$(1))
+	$$(GO_ENV.$(1)) cd tests && go test -v ./$(1)/... -timeout 0 -count=1 -skip 'Performance'
+endef
+$(foreach d,$(SOURCE_DRIVERS),$(eval $(call DRIVER_TEST_template,$(d))))
+
 define INTEGRATION_TEST_template
 .PHONY: test.integration.$(1)
-test.integration.$(1): prepare.$(1) db.$(1).start db.destination.all.start $$(ICEBERG_JAR)
+test.integration.$(1): prepare.$(1)
+	@$$(call driver_test_setup,$(1))
 	$$(GO_ENV.$(1)) cd tests && go test -v ./$(1)/... -timeout 0 -count=1 -run 'Integration'
 endef
 $(foreach d,$(SOURCE_DRIVERS),$(eval $(call INTEGRATION_TEST_template,$(d))))
 
 define TWO_PC_TEST_template
 .PHONY: test.2pc.$(1)
-test.2pc.$(1): prepare.$(1) db.$(1).start db.destination.all.start $$(ICEBERG_JAR)
+test.2pc.$(1): prepare.$(1)
+	@$$(call driver_test_setup,$(1))
 	$$(GO_ENV.$(1)) cd tests && go test -v ./$(1)/... -timeout 0 -count=1 -run '2PC'
 endef
 $(foreach d,$(CDC_DRIVERS),$(eval $(call TWO_PC_TEST_template,$(d))))
@@ -382,9 +424,11 @@ help:
 	@$(foreach d,$(DRIVERS),printf "  %-44s %s\n" "docker.$(d).build" "build the $(d) driver image (olake/source-$(d):$(IMAGE_TAG))";)
 	@echo ""
 	@echo "Tests (auto-provision the databases they need):"
+	@printf "  %-44s %s\n" "iceberg.jar" "build the Iceberg writer JAR (skips maven when up to date)"
+	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "test.driver.$(d)" "every CI suite for $(d) (what the matrix job runs)";)
 	@$(foreach d,$(SOURCE_DRIVERS),printf "  %-44s %s\n" "test.integration.$(d)" "integration suite for $(d)";)
 	@$(foreach d,$(CDC_DRIVERS),printf "  %-44s %s\n" "test.2pc.$(d)" "2PC recovery suite for $(d)";)
-	@printf "  %-44s %s\n" "test.integration | test.2pc | test.unit" "aggregate runs (CI-equivalent)"
+	@printf "  %-44s %s\n" "test.integration | test.2pc | test.unit" "aggregate runs (all drivers at once)"
 	@if [ -n "$(strip $(HELP_TARGETS))" ]; then \
 		echo ""; \
 		echo "Driver-specific:"; \

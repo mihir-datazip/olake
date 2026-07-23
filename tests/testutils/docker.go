@@ -21,12 +21,17 @@ const (
 	// skipDestinationCheckEnvVar mirrors destination.SkipDestinationCheckEnvVar. Declared here
 	// rather than imported so this module keeps no dependency on the root one.
 	skipDestinationCheckEnvVar = "OLAKE_SKIP_DESTINATION_CHECK"
+
+	// driverImageEnvVar pins the image to run instead of the conventional
+	// `olake/source-<driver>:local`. Setting it also means "this image is already what I want" —
+	// see getOrBuildDriverImage.
+	driverImageEnvVar = "OLAKE_DRIVER_IMAGE"
 )
 
 // driverImageRef returns the image the harness runs, `olake/source-<driver>:local` as
 // built by `make docker.<driver>.build`; OLAKE_DRIVER_IMAGE overrides it.
 func driverImageRef(driver string) string {
-	if ref := os.Getenv("OLAKE_DRIVER_IMAGE"); ref != "" {
+	if ref := os.Getenv(driverImageEnvVar); ref != "" {
 		return ref
 	}
 	return fmt.Sprintf("olake/source-%s:local", driver)
@@ -37,14 +42,23 @@ var (
 	ensureImageErr  error
 )
 
-// getOrBuildDriverImage makes sure the driver image is up to date, (re)building it via
+// getOrBuildDriverImage returns the driver image to run, (re)building it via
 // `make docker.<driver>.build` unconditionally so a local run always exercises the current
-// code -- docker's layer cache makes that near-free when nothing changed. CI pre-builds the
-// image; this fallback keeps local runs one-command. Guarded by sync.Once so parallel tests
-// trigger the (slow) build at most once and all share its result.
+// code -- docker's layer cache makes that near-free when nothing changed.
+//
+// OLAKE_DRIVER_IMAGE suppresses the build: pinning an image means the caller already produced
+// exactly the artifact it wants tested. CI relies on that -- it builds through buildx with a
+// shared layer cache the plain `docker build` here would not reach, so rebuilding would both
+// waste the cache and risk testing a different image than the one it checked.
+//
+// Guarded by sync.Once so parallel tests trigger the (slow) build at most once and all share
+// its result.
 func getOrBuildDriverImage(t *testing.T, cfg *TestConfig) string {
 	t.Helper()
 	ref := driverImageRef(cfg.Driver)
+	if os.Getenv(driverImageEnvVar) != "" {
+		return ref
+	}
 	ensureImageOnce.Do(func() {
 		t.Logf("building driver image %s with `make docker.%s.build` to pick up the latest local changes", ref, cfg.Driver)
 		// wall-clock via trackPhaseTiming, not cmd.ProcessState.SystemTime() (that reports make's
